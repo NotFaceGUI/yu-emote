@@ -1,0 +1,34 @@
+yu-emote
+Copyright (c) 2026 NotFaceGUI
+
+This product includes software developed by third parties:
+
+1. emote-psb (https://github.com/storycraft/emote-psb-rs)
+   Copyright (c) storycraft
+   Licensed under the MIT License.
+   Used as the PSB/MDF binary parser dependency.
+
+2. amadeus-emote-loader (https://github.com/Mieluoxxx/amadeus-emote-loader)
+   Licensed under the Apache License, Version 2.0.
+   Referenced for model normalization, part-table semantics and the wasm byte
+   ABI. No source code is copied in this milestone; if code is adopted later,
+   the adopted files will carry an Apache-2.0 header and this NOTICE will be
+   updated.
+
+Reference-only facts (no code copied):
+
+0a. PSB body stream cipher (6-word state) and single-DWORD key search are
+    documented by FreeMote (CC BY-NC-SA 4.0) and eluna (no license). The
+    implementation in src/psb.rs is independent.
+
+Reference-only projects (no code copied):
+
+3. eluna (https://github.com/xmoezzz/eluna) — no license declared; used only
+   as a behavioral reference for schema/runtime extraction.
+
+4. FreeMote and the FreeMote WebGL runtime
+   (https://github.com/UlyssesWu/FreeMote) — CC BY-NC-SA 4.0; used only as an
+   oracle/reference. No code is incorporated.
+
+E-mote is a product of M2 Co., Ltd. This project is not affiliated with,
+endorsed by, or sponsored by M2.
