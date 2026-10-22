@@ -10,6 +10,11 @@
 //!
 //! - [`psb`]: PSB/MDF container parsing (delegates the binary format to the
 //!   MIT-licensed `emote-psb` crate).
+//! - [`schema`]: typed model extraction (screen, atlas pages, objects,
+//!   motions, layers, variables, timelines, controllers).
+//! - [`texture`]: RGBA4444 atlas decoding (evidenced by the official DLL).
+//! - [`anim`]: deterministic variable/timeline state (M2).
+//! - [`render`]: WGSL variants and Bezier mesh generation (M3).
 //! - [`model`]: deterministic, renderer-independent summary of an E-mote PSB
 //!   tree (version, top-level sections, node counts, resource counts).
 //! - [`yuris`]: YU-RIS glue — `EMOTE` parameter recording, `EMOTEINFO`
@@ -38,14 +43,21 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod anim;
 pub mod error;
 pub mod model;
 pub mod psb;
+pub mod render;
+pub mod schema;
+pub mod texture;
 pub mod yuris;
 
+pub use anim::Animator;
 pub use error::EmoteError;
 pub use model::{ModelSummary, PsbNodeCounts};
 pub use psb::PsbDocument;
+pub use schema::Model;
+pub use texture::DecodedTexture;
 pub use yuris::{Capability, EmoteArg, YurisEmote};
 
 /// Crate version.

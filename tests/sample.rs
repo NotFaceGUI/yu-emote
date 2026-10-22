@@ -29,6 +29,11 @@ fn emote_test_sample_parses() {
     let path = match std::env::var("YURIS_EMOTE_SAMPLE") {
         Ok(path) => path,
         Err(_) => {
+            assert_ne!(
+                std::env::var("YURIS_REQUIRE_SAMPLES").as_deref(),
+                Ok("1"),
+                "YURIS_REQUIRE_SAMPLES=1 but YURIS_EMOTE_SAMPLE is not set"
+            );
             eprintln!("SKIP: set YURIS_EMOTE_SAMPLE to emote_test.psb");
             return;
         }

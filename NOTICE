@@ -30,5 +30,11 @@ Reference-only projects (no code copied):
    (https://github.com/UlyssesWu/FreeMote) — CC BY-NC-SA 4.0; used only as an
    oracle/reference. No code is incorporated.
 
+Facts about the official binaries (function addresses, shader variant counts,
+texture bit layout, key-string location) were obtained by inspecting the
+shipped SDK 0.495 `YSEmote.dll`/`emotedriver.dll` for interoperability. No
+official code or shader source was copied; the WGSL in `src/render.rs` is an
+independent description of the observed program semantics.
+
 E-mote is a product of M2 Co., Ltd. This project is not affiliated with,
 endorsed by, or sponsored by M2.

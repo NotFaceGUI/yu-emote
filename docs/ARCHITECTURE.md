@@ -21,13 +21,15 @@
 ┌─────────────────────────────────────────────────────────────┐
 │ yu-emote                                                    │
 │                                                             │
-│  psb      PSB/MDF container (emote-psb, MIT)                │
+│  psb      PSB/MDF container, body cipher, resources         │
 │   │                                                         │
-│  model    generic tree summary; schema extraction (M1)      │
+│  model    generic tree summary                              │
+│  schema   typed model: atlas, objects, layers, timelines    │
+│  texture  RGBA4444 atlas decode (A4R4G4B4 order)            │
 │   │                                                         │
-│  anim     parameters, timelines, part visibility (M2)       │
+│  anim     variables, timelines, fades, deterministic clock  │
 │   │                                                         │
-│  render   mesh/skin, atlas, 58 shader variants (M3)         │
+│  render   58 WGSL variants, Bezier mesh tessellation        │
 │                                                             │
 │  yuris    EMOTE/EMOTEINFO, capability, suspend, dirty       │
 └─────────────────────────────────────────────────────────────┘
@@ -82,13 +84,18 @@ library; tests read it from `YURIS_EMOTE_KEY`.
 
 ## Milestones
 
-- **M1** PSB schema/model extraction: metadata, textures, parts, bones,
-  motion/timeline structure; deterministic dumps; normalization matching
-  `amadeus-emote-loader`'s documented rules (Apache-2.0, with attribution).
-- **M2** animation: `VAR/PLAY/DPLAY/STOP/DSTOP/VO`, differential timelines,
-  mouth sync; fixed-tick evaluation.
-- **M3** renderer: 27 ps_2_0 + 27 ps_3_0 + 4 vertex variants mapped to WGSL;
-  atlas, alpha mask, pixelate; mesh skinning.
+- **M1 (done in this tree)** typed PSB schema (`schema`), `RGBA4444` atlas
+  decoding (`texture`), deterministic `psb-dump`, sample-backed tests. The
+  source layout and filter rules from `amadeus-emote-loader` (Apache-2.0) are
+  documented behavior references; no code was copied.
+- **M2 (core done)** `Animator`: named variables, optional fades, timeline
+  playback/stop, looping, linear keyframe sampling, deterministic `tick`. The
+  official frame rate and non-zero easing curves still need oracle evidence;
+  the caller supplies the frame rate, and unsupported easing is held.
+- **M3 (core done)** all 58 official shader variants are represented as WGSL
+  feature sets; a cubic Bezier patch tessellator generates mesh grids. The
+  wgpu pipeline and the runtime's variant-selection rules are the remaining
+  work.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.
 

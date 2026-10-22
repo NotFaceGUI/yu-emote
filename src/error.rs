@@ -50,6 +50,52 @@ pub enum EmoteError {
     #[error("unsupported EMOTEINFO field `{0}`")]
     UnsupportedInfo(String),
 
+    /// A texture page uses a format this build cannot decode.
+    #[error("unsupported texture format `{format}`")]
+    UnsupportedTextureFormat {
+        /// Format name from `source/tex#N/texture/type`.
+        format: String,
+    },
+
+    /// A texture page references no resource, or the index is out of range.
+    #[error("texture page `{page}` has no resource (index {index:?})")]
+    TextureResourceMissing {
+        /// Page name (`tex#0`, ...).
+        page: String,
+        /// Referenced resource index.
+        index: Option<usize>,
+    },
+
+    /// The resource length does not match the declared dimensions.
+    #[error("texture {width}x{height} needs {expected} bytes, resource has {actual}")]
+    TextureSizeMismatch {
+        /// Declared width.
+        width: u32,
+        /// Declared height.
+        height: u32,
+        /// Expected byte count.
+        expected: usize,
+        /// Actual byte count.
+        actual: usize,
+    },
+
+    /// The declared dimensions overflow `usize`.
+    #[error("texture dimensions {width}x{height} overflow")]
+    TextureSizeOverflow {
+        /// Declared width.
+        width: u32,
+        /// Declared height.
+        height: u32,
+    },
+
+    /// A model does not contain the requested timeline.
+    #[error("unknown timeline `{0}`")]
+    UnknownTimeline(String),
+
+    /// A model does not contain the requested variable.
+    #[error("unknown variable `{0}`")]
+    UnknownVariable(String),
+
     /// The adapter is not allowed to advance animation yet.
     #[error("E-mote runtime is not ready (capability: {0})")]
     NotReady(crate::yuris::Capability),

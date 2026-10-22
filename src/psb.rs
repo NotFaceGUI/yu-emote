@@ -40,9 +40,9 @@ const PSB_TYPE_OBJECT: u8 = 0x21;
 
 /// Parsed PSB document plus its container facts.
 ///
-/// Binary resources (`Resource`/`ExtraResource` nodes) are kept as indices;
-/// their bytes are not loaded into memory. Use the underlying `emote-psb`
-/// stream API if byte access is needed.
+/// Binary resource bytes are copied into [`PsbDocument::resource_data`] while
+/// the file is being read; `Resource`/`ExtraResource` values in the tree remain
+/// indices into that vector.
 #[derive(Debug)]
 pub struct PsbDocument {
     /// PSB format version (2 for the YU-RIS `emote_test.psb` sample).
@@ -55,6 +55,12 @@ pub struct PsbDocument {
     pub extra_resources: usize,
     /// Decoded root value.
     pub root: PsbValue,
+    /// Raw bytes of every embedded resource, in PSB resource-index order.
+    ///
+    /// E-mote models store texture pages here (`source/tex#N/texture/pixel`
+    /// references an index into this vector). The bytes are not decoded by
+    /// this layer; see [`crate::texture`].
+    pub resource_data: Vec<Vec<u8>>,
     /// Key used to decrypt the body, if any.
     pub key: Option<u32>,
 }
@@ -174,6 +180,14 @@ pub fn read_psb<R: BufRead + Seek>(reader: R) -> Result<PsbDocument, EmoteError>
     let encrypted = file.encrypted;
     let resources = file.resources();
     let extra_resources = file.extra_resources();
+    let mut resource_data = Vec::with_capacity(resources);
+    for index in 0..resources {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = file.open_resource(index)? {
+            stream.read_to_end(&mut bytes)?;
+        }
+        resource_data.push(bytes);
+    }
     let root: PsbValue = file.deserialize_root()?;
     Ok(PsbDocument {
         version,
@@ -181,6 +195,7 @@ pub fn read_psb<R: BufRead + Seek>(reader: R) -> Result<PsbDocument, EmoteError>
         resources,
         extra_resources,
         root,
+        resource_data,
         key: None,
     })
 }

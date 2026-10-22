@@ -14,9 +14,10 @@ native + `wasm32` use.
 | Body decryption (E-mote key) + key search | ✅ (per-game key, not shipped) |
 | Deterministic model summary (`psb-info`) | ✅ |
 | YU-RIS adapter: `EMOTE` params, `EMOTEINFO` queries, capability, suspend/dirty | ✅ |
-| PSB model normalization / part visibility | ⏳ M1 |
-| Motion/timeline evaluation (VAR/PLAY/DPLAY/STOP/DSTOP/VO) | ⏳ M2 |
-| wgpu / WebGPU mesh renderer (58 E-mote shader variants) | ⏳ M3 |
+| Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
+| Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
+| Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
+| WGSL for all 58 official shader variants + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
 This repository intentionally does **not** claim rendering yet. The first
@@ -32,11 +33,46 @@ cargo run --bin psb-info -- /path/to/model.psb
 # Body-encrypted PSB (recover the per-game key first)
 cargo run --release --bin psb-key-search -- /path/to/model.psb
 cargo run --bin psb-info -- /path/to/model.psb --key 0x175058c9
+
+# Deterministic typed dump (+ optional raw tree, resources, decoded textures)
+cargo run --bin psb-dump -- /path/to/model.psb --key 0x175058c9
+cargo run --bin psb-dump -- model.psb --key 0x175058c9 --raw --resources out --decode
 ```
 
 Verified against the YU-RIS ERIS sample `emote_test.psb` (PSB v2, body key
-`0x175058c9`): 2 texture resources, `metadata` present, 5863 objects, max
-depth 36. The key is data-specific and is **not** hardcoded in the library.
+`0x175058c9`): 2 texture pages (`tex#0` 2048x2048 / `tex#1` 512x256, both
+`RGBA4444`), 6 objects, 21 motions, 234 layers, 888 layer keyframes, 24
+variables, 11 timelines. The key is data-specific and is **not** hardcoded in
+the library.
+
+## Evidence-backed facts
+
+These come from the official SDK 0.495 binaries and the official sample; they
+are recorded here so the implementation can be audited against them:
+
+- **Key source.** `PEmotePlayer`'s constructor calls `strtol` on the decimal
+  string `"391141577"` at `emotedriver.dll` VA `0x10071350` and uses the result
+  as the fourth word of the PSB body cipher (`0x175058C9` for this build).
+  Games may ship a different `emotedriver.dll`; the key is not a constant of
+  the model format.
+- **Texture order.** `RGBA4444` pixels use the `D3DFMT_A4R4G4B4` bit layout
+  (alpha bits 15..12, red 11..8, green 7..4, blue 3..0), expanded with `n*17`.
+  This matches the DLL's converter at `0x10054BA0` and reproduces the official
+  atlas colors; the opposite nibble order swaps hair/skin colors.
+- **Shader table.** `emotedriver.dll` holds 58 unique D3D9 programs in the
+  pointer table at VA `0x100866c0..0x100867ac`: 27 `ps_2_0`, 27 `ps_3_0`,
+  3 `vs_2_0`, 1 `vs_3_0`. The 27 pixel programs are 13 plain, 13 alpha-mask
+  (`cAlphaMaskTex.g`), 1 pixelate (`cPixelateTex`); `ps_3_0` masked variants
+  add `float2 cScMul`. [`src/render.rs`](src/render.rs) records each variant's
+  feature set.
+- **YSEmote dispatch.** `YSEmote.dll` exports ordinal 2 = `EmoteCreate`,
+  ordinal 3 = `EmoteFilterTexture`; ordinals 101..121 call the device vtable
+  slots `+0x00..+0x50`, ordinals 201..256 call the player vtable slots
+  `+0x00..+0xdc`. The engine's loader stores them at `yu-ris.exe` `0x801384..`.
+- **Contracts.** `EMOTE` resolves the character, then applies named string /
+  flag / numeric variables; numeric fades are converted with `value * 0.06`
+  before reaching the player. `EMOTEINFO` calls player slot 45. Details and
+  remaining gaps are in the kernel's `docs/emote-parity.md`.
 
 ```rust
 use yu_emote::model::ModelSummary;
