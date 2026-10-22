@@ -18,7 +18,7 @@ native + `wasm32` use.
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
 | Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
 | Part visibility / normalization rules | ⏳ M1 remainder (evidence pending) |
-| WGSL for all 58 official shader variants + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
+| WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
 This repository intentionally does **not** claim rendering yet. The first

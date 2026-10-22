@@ -93,10 +93,10 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   playback/stop, looping, linear keyframe sampling, deterministic `tick`. The
   official frame rate and non-zero easing curves still need oracle evidence;
   the caller supplies the frame rate, and unsupported easing is held.
-- **M3 (core done)** all 58 official shader variants are represented as WGSL
-  feature sets; a cubic Bezier patch tessellator generates mesh grids. The
-  wgpu pipeline and the runtime's variant-selection rules are the remaining
-  work.
+- **M3 (core done)** all 58 official shader variants are committed as WGSL
+  files under `shaders/` (one file per official program index); a cubic Bezier
+  patch tessellator generates mesh grids. The wgpu pipeline and the runtime's
+  variant-selection rules are the remaining work.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.
 

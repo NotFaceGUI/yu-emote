@@ -34,7 +34,8 @@ Facts about the official binaries (function addresses, shader variant counts,
 texture bit layout, key-string location) were obtained by inspecting the
 shipped SDK 0.495 `YSEmote.dll`/`emotedriver.dll` for interoperability. No
 official code or shader source was copied; the WGSL in `src/render.rs` is an
-independent description of the observed program semantics.
+independent description of the observed program semantics; the WGSL files
+under `shaders/` are generated from the feature table in `src/render.rs`.
 
 E-mote is a product of M2 Co., Ltd. This project is not affiliated with,
 endorsed by, or sponsored by M2.
