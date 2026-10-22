@@ -17,6 +17,8 @@ native + `wasm32` use.
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
 | Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
+| Layer/frame evaluation, nested motions, `priority` draw order (`psb-pose`) | ✅ M2 core (stencil/mask composition pending) |
+| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG) | ✅ M3 baseline (wgpu pipeline + official parity pending) |
 | Part visibility / normalization rules | ⏳ M1 remainder (evidence pending) |
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
@@ -38,6 +40,11 @@ cargo run --bin psb-info -- /path/to/model.psb --key 0x175058c9
 # Deterministic typed dump (+ optional raw tree, resources, decoded textures)
 cargo run --bin psb-dump -- /path/to/model.psb --key 0x175058c9
 cargo run --bin psb-dump -- model.psb --key 0x175058c9 --raw --resources out --decode
+
+# Pose / draw plan / software render
+cargo run --bin psb-pose -- model.psb --key 0x175058c9 --time 0
+cargo run --bin psb-plan -- model.psb --key 0x175058c9 --time 0
+cargo run --bin psb-render -- model.psb --key 0x175058c9 --time 0 --out out.png
 ```
 
 Verified against the YU-RIS ERIS sample `emote_test.psb` (PSB v2, body key

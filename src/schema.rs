@@ -136,6 +136,36 @@ fn intrinsic(name: &str) -> JsonValue {
     JsonValue::Object(map)
 }
 
+fn json_to_psb(value: &JsonValue) -> Option<PsbValue> {
+    match value {
+        JsonValue::Null => Some(PsbValue::Null),
+        JsonValue::Bool(value) => Some(PsbValue::Bool(*value)),
+        JsonValue::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Some(PsbValue::Number(PsbNumber::Integer(integer)))
+            } else {
+                value
+                    .as_f64()
+                    .map(|value| PsbValue::Number(PsbNumber::Double(value)))
+            }
+        }
+        JsonValue::String(value) => Some(PsbValue::String(value.as_str().into())),
+        JsonValue::Array(items) => Some(PsbValue::List(
+            items.iter().filter_map(json_to_psb).collect(),
+        )),
+        JsonValue::Object(map) => {
+            if map.contains_key("$resource") || map.contains_key("$intrinsic") {
+                return None;
+            }
+            let mut out = PsbMap::new();
+            for (key, value) in map {
+                out.insert(key.as_str().into(), json_to_psb(value)?);
+            }
+            Some(PsbValue::Object(out))
+        }
+    }
+}
+
 fn float_json(value: f64) -> JsonValue {
     serde_json::Number::from_f64(value).map_or(JsonValue::Null, JsonValue::Number)
 }
@@ -361,6 +391,32 @@ pub struct TimelineFrame {
     pub value: f64,
 }
 
+/// Reference from a layer's `parameterize` field.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum ParameterRef {
+    /// Index into the root `parameter` list.
+    Index(i64),
+    /// Inline parameter object (normalized/debug PSB form).
+    Inline(JsonValue),
+}
+
+/// One entry of the root `parameter` table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ParameterDef {
+    /// `id` / `key` / `name`.
+    pub id: Option<String>,
+    /// `rangeBegin` / `min`.
+    pub range_begin: f64,
+    /// `rangeEnd` / `max`.
+    pub range_end: f64,
+    /// `division`: authored parameter-time domain.
+    pub division: f64,
+    /// `discretization`: truncate the value before clamping and scaling.
+    pub discretization: bool,
+    /// Complete parameter object, sorted.
+    pub raw: JsonValue,
+}
+
 /// One object definition (`object/<name>`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ObjectDef {
@@ -372,6 +428,15 @@ pub struct ObjectDef {
     pub motions: BTreeMap<String, Motion>,
 }
 
+/// One `priority` frame: draw order of the motion's flattened layers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct PriorityFrame {
+    /// Frame time.
+    pub time: i64,
+    /// Layer indices in draw order; `None` for terminal frames.
+    pub content: Option<Vec<i64>>,
+}
+
 /// A motion (`object/<name>/motion/<motion>`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Motion {
@@ -381,6 +446,8 @@ pub struct Motion {
     pub bounds: Bounds,
     /// Layer label to index map (`layerIndexMap`).
     pub layer_index_map: BTreeMap<String, i64>,
+    /// Draw-order frames (`priority`).
+    pub priority: Vec<PriorityFrame>,
     /// Root layers.
     pub layers: Vec<Layer>,
 }
@@ -389,6 +456,26 @@ impl Motion {
     /// Number of layers in this motion, including descendants.
     pub fn layer_count(&self) -> usize {
         count_layers(&self.layers)
+    }
+
+    /// Rank map for the `priority` frame active at `time`.
+    ///
+    /// The value is the position in the priority list. Layers missing from a
+    /// malformed list keep their structural index via the caller's fallback.
+    pub fn priority_ranks(&self, time: f64) -> BTreeMap<i64, i64> {
+        let frame = self
+            .priority
+            .iter()
+            .rev()
+            .find(|frame| frame.time as f64 <= time);
+        let Some(content) = frame.and_then(|frame| frame.content.as_ref()) else {
+            return BTreeMap::new();
+        };
+        content
+            .iter()
+            .enumerate()
+            .map(|(position, index)| (*index, position as i64))
+            .collect()
     }
 }
 
@@ -430,12 +517,17 @@ pub struct Layer {
     pub mesh_sync_child_mask: Option<i64>,
     /// `meshDivision` (observed 20).
     pub mesh_division: Option<i64>,
-    /// `parameterize`.
-    pub parameterize: Option<i64>,
+    /// `parameterize`: either an index into the root `parameter` table or an
+    /// inline parameter object.
+    pub parameterize: Option<ParameterRef>,
+    /// `motionIndependentLayerInherit`.
+    pub motion_independent_layer_inherit: Option<i64>,
     /// `stencilType`.
     pub stencil_type: Option<i64>,
     /// `objTriPriority`.
     pub obj_tri_priority: Option<i64>,
+    /// `transformOrder`: permutation of flip/rotation/scale/shear stages.
+    pub transform_order: Vec<i64>,
     /// Keyframes.
     pub frames: Vec<Frame>,
     /// Child layers.
@@ -449,6 +541,8 @@ pub struct Frame {
     pub time: i64,
     /// Frame kind (`type`): observed values 0, 2, 3.
     pub kind: i64,
+    /// Optional integer time quantization (`ti`).
+    pub time_quantization: Option<i64>,
     /// Keyframe content; absent for terminal frames.
     pub content: Option<Content>,
 }
@@ -462,18 +556,54 @@ pub struct Content {
     pub icon: Option<IconRef>,
     /// Mask bits (`mask`).
     pub mask: Option<i64>,
-    /// Position (`coord`), first two components.
-    pub coord: Option<[f64; 2]>,
-    /// Rotation (`angle`) in degrees, as stored.
+    /// Position (`coord`): x, y, z (z selects the coordinate plane).
+    pub coord: Option<[f64; 3]>,
+    /// Origin X (`ox`), used by sprite/materialization paths.
+    pub ox: Option<f64>,
+    /// Origin Y (`oy`).
+    pub oy: Option<f64>,
+    /// Horizontal flip (`fx`).
+    pub flip_x: Option<bool>,
+    /// Vertical flip (`fy`).
+    pub flip_y: Option<bool>,
+    /// X scale (`zx` / `scale_x` / `scale` / `zoom`).
+    pub scale_x: Option<f64>,
+    /// Y scale (`zy` / `scale_y` / `scale` / `zoom`).
+    pub scale_y: Option<f64>,
+    /// Rotation in degrees (`angle` / `rot` / `rotation`).
     pub angle: Option<f64>,
-    /// Color (`color`), up to four components.
-    pub color: Option<[f64; 4]>,
-    /// Opacity (`opa`).
+    /// X shear (`sx`).
+    pub shear_x: Option<f64>,
+    /// Y shear (`sy`).
+    pub shear_y: Option<f64>,
+    /// Four corner colors (`color`), each `0xAARRGGBB`.
+    pub color: Option<[u32; 4]>,
+    /// Whether `color` was authored as a single scalar (broadcast).
+    pub color_single: bool,
+    /// Opacity (`opa`), 0..255 in official data.
     pub opa: Option<f64>,
+    /// Blend mode (`bm`), default 0x10.
+    pub blend_mode: Option<u32>,
+    /// Blend parameter (`bp`).
+    pub blend_parameter: Option<f64>,
     /// Mesh control points (`mesh`).
     pub mesh: Option<Mesh>,
-    /// Referenced sub-motion (`motion`), for layer kind 3.
+    /// Referenced sub-motion (`motion`) when stored as a string.
     pub motion: Option<String>,
+    /// Sub-motion time offset (`motion/timeOffset` or top-level `timeOffset`).
+    pub motion_time_offset: Option<f64>,
+    /// Sub-motion flags (`motion/flags`).
+    pub motion_flags: Option<u32>,
+    /// Sub-motion mask (`motion/mask`).
+    pub motion_mask: Option<i64>,
+    /// Stencil wipe enabled (`stc`).
+    pub stencil_wipe_enabled: Option<bool>,
+    /// Stencil wipe reverse (`wrv`).
+    pub stencil_wipe_reverse: Option<bool>,
+    /// Stencil wipe threshold (`wrt`).
+    pub stencil_wipe_threshold: Option<f64>,
+    /// Stencil wipe softness (`wsf`).
+    pub stencil_wipe_softness: Option<f64>,
 }
 
 /// An atlas icon reference. The official content stores either a numeric icon
@@ -557,6 +687,8 @@ pub struct Model {
     pub screen: ScreenSize,
     /// Metadata.
     pub metadata: Metadata,
+    /// Root `parameter` table (used by layer `parameterize` indices).
+    pub parameters: Vec<ParameterDef>,
     /// Texture atlas pages, sorted by name.
     pub sources: Vec<TextureSource>,
     /// Objects keyed by name, sorted.
@@ -584,6 +716,7 @@ impl Model {
             version: field(root, "version").and_then(as_f64),
             screen: screen_size(field(root, "screenSize")),
             metadata: Metadata::default(),
+            parameters: Vec::new(),
             sources: Vec::new(),
             objects: BTreeMap::new(),
             variables: Vec::new(),
@@ -612,6 +745,10 @@ impl Model {
             model.timelines = timelines(map);
             model.controllers = controllers(map);
         }
+        model.parameters = list_or_empty(field(root, "parameter"))
+            .iter()
+            .map(parameter_def)
+            .collect();
 
         if let Some(source) = field(root, "source") {
             let mut pages: Vec<_> = obj_or_empty(Some(source))
@@ -837,6 +974,18 @@ fn motion(value: &PsbValue) -> Motion {
             layer_index_map.insert(label.to_string(), index);
         }
     }
+    let priority = list_or_empty(get(map, "priority"))
+        .iter()
+        .map(|frame| {
+            let frame = obj_or_empty(Some(frame));
+            PriorityFrame {
+                time: get_i64(frame, "time").unwrap_or_default(),
+                content: get(frame, "content")
+                    .and_then(as_list)
+                    .map(|items| items.iter().filter_map(as_i64).collect()),
+            }
+        })
+        .collect();
     Motion {
         last_time: get_i64(map, "lastTime").unwrap_or_default(),
         bounds: Bounds {
@@ -846,6 +995,7 @@ fn motion(value: &PsbValue) -> Motion {
             bottom: get_f64(bounds, "bottom").unwrap_or_default(),
         },
         layer_index_map,
+        priority,
         layers: layers(get(map, "layer")),
     }
 }
@@ -862,6 +1012,7 @@ fn layer(value: &PsbValue) -> Layer {
         frames.push(Frame {
             time: get_i64(frame, "time").unwrap_or_default(),
             kind: get_i64(frame, "type").unwrap_or_default(),
+            time_quantization: get_i64(frame, "ti"),
             content: get(frame, "content").map(content),
         });
     }
@@ -877,9 +1028,14 @@ fn layer(value: &PsbValue) -> Layer {
         mesh_transform: get_i64(map, "meshTransform"),
         mesh_sync_child_mask: get_i64(map, "meshSyncChildMask"),
         mesh_division: get_i64(map, "meshDivision"),
-        parameterize: get_i64(map, "parameterize"),
+        parameterize: get(map, "parameterize").and_then(parameter_ref),
+        motion_independent_layer_inherit: get_i64(map, "motionIndependentLayerInherit"),
         stencil_type: get_i64(map, "stencilType"),
         obj_tri_priority: get_i64(map, "objTriPriority"),
+        transform_order: get(map, "transformOrder")
+            .and_then(as_list)
+            .map(|items| items.iter().filter_map(as_i64).collect())
+            .unwrap_or_default(),
         frames,
         children: layers(get(map, "children")),
     }
@@ -887,16 +1043,102 @@ fn layer(value: &PsbValue) -> Layer {
 
 fn content(value: &PsbValue) -> Content {
     let map = obj_or_empty(Some(value));
+    let (color, color_single) = color_of(map);
+    let motion_obj = get(map, "motion").and_then(as_object);
     Content {
         src: get_str(map, "src"),
         icon: get(map, "icon").and_then(icon_ref),
         mask: get_i64(map, "mask"),
-        coord: get(map, "coord").and_then(vector::<2>),
-        angle: get_f64(map, "angle"),
-        color: get(map, "color").and_then(vector::<4>),
+        coord: get(map, "coord").and_then(vector::<3>),
+        ox: get_f64(map, "ox"),
+        oy: get_f64(map, "oy"),
+        flip_x: get(map, "fx").and_then(bool_like),
+        flip_y: get(map, "fy").and_then(bool_like),
+        scale_x: first_f64(map, &["zx", "scale_x", "scaleX", "scale", "zoom"]),
+        scale_y: first_f64(map, &["zy", "scale_y", "scaleY", "scale", "zoom"]),
+        angle: first_f64(map, &["angle", "rot", "rotation"]),
+        shear_x: get_f64(map, "sx"),
+        shear_y: get_f64(map, "sy"),
+        color,
+        color_single,
         opa: get_f64(map, "opa"),
+        blend_mode: get(map, "bm").and_then(as_i64).map(|value| value as u32),
+        blend_parameter: get_f64(map, "bp"),
         mesh: get(map, "mesh").map(mesh),
         motion: get_str(map, "motion"),
+        motion_time_offset: motion_obj
+            .and_then(|motion| get_f64(motion, "timeOffset"))
+            .or_else(|| get_f64(map, "timeOffset")),
+        motion_flags: motion_obj
+            .and_then(|motion| get(motion, "flags"))
+            .and_then(as_i64)
+            .map(|value| value as u32),
+        motion_mask: motion_obj.and_then(|motion| get_i64(motion, "mask")),
+        stencil_wipe_enabled: get(map, "stc").and_then(bool_like),
+        stencil_wipe_reverse: get(map, "wrv").and_then(bool_like),
+        stencil_wipe_threshold: get_f64(map, "wrt"),
+        stencil_wipe_softness: get_f64(map, "wsf"),
+    }
+}
+
+fn first_f64(map: &PsbMap, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|key| get_f64(map, key))
+}
+
+fn bool_like(value: &PsbValue) -> Option<bool> {
+    match value {
+        PsbValue::Bool(value) => Some(*value),
+        _ => as_i64(value).map(|value| value != 0),
+    }
+}
+
+fn color_of(map: &PsbMap) -> (Option<[u32; 4]>, bool) {
+    let Some(value) = get(map, "color") else {
+        return (None, false);
+    };
+    if let Some(items) = as_list(value) {
+        if items.len() >= 4 {
+            let mut out = [0u32; 4];
+            for (slot, item) in out.iter_mut().zip(items.iter().take(4)) {
+                *slot = as_i64(item).unwrap_or_default() as u32;
+            }
+            return (Some(out), false);
+        }
+        if let Some(first) = items.first().and_then(as_i64) {
+            return (Some([first as u32; 4]), true);
+        }
+        return (None, false);
+    }
+    as_i64(value)
+        .map(|value| (Some([value as u32; 4]), true))
+        .unwrap_or((None, false))
+}
+
+fn parameter_ref(value: &PsbValue) -> Option<ParameterRef> {
+    match value {
+        PsbValue::Object(_) => Some(ParameterRef::Inline(value_to_json(value))),
+        _ => as_i64(value).map(ParameterRef::Index),
+    }
+}
+
+fn parameter_def(value: &PsbValue) -> ParameterDef {
+    let map = obj_or_empty(Some(value));
+    ParameterDef {
+        id: get_str(map, "id")
+            .or_else(|| get_str(map, "key"))
+            .or_else(|| get_str(map, "name"))
+            .filter(|id| !id.is_empty()),
+        range_begin: get_f64(map, "rangeBegin")
+            .or_else(|| get_f64(map, "min"))
+            .unwrap_or_default(),
+        range_end: get_f64(map, "rangeEnd")
+            .or_else(|| get_f64(map, "max"))
+            .unwrap_or(1.0),
+        division: get_f64(map, "division").unwrap_or(1.0),
+        discretization: get(map, "discretization")
+            .and_then(bool_like)
+            .unwrap_or(false),
+        raw: value_to_json(value),
     }
 }
 
@@ -989,6 +1231,26 @@ impl Model {
         self.timelines
             .iter()
             .find(|timeline| timeline.label == name)
+    }
+
+    /// Resolve a layer's `parameterize` reference.
+    pub fn parameter(&self, reference: &ParameterRef) -> Option<ParameterDef> {
+        match reference {
+            ParameterRef::Index(index) if *index >= 0 => {
+                self.parameters.get(*index as usize).cloned()
+            }
+            ParameterRef::Index(_) => None,
+            ParameterRef::Inline(raw) => match raw {
+                JsonValue::Object(map) => {
+                    let mut psb = PsbMap::new();
+                    for (key, value) in map {
+                        psb.insert(key.as_str().into(), json_to_psb(value)?);
+                    }
+                    Some(parameter_def(&PsbValue::Object(psb)))
+                }
+                _ => None,
+            },
+        }
     }
 
     /// Number of texture pages (typed accessor; serialized as `sources`).

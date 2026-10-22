@@ -14,6 +14,9 @@
 //!   motions, layers, variables, timelines, controllers).
 //! - [`texture`]: RGBA4444 atlas decoding (evidenced by the official DLL).
 //! - [`anim`]: deterministic variable/timeline state (M2).
+//! - [`pose`]: layer/frame evaluation and transform composition (M2).
+//! - [`plan`]: pose to textured mesh draw list (M3 geometry bridge).
+//! - [`soft`]: deterministic CPU rasterizer for validation and screenshots.
 //! - [`render`]: WGSL variants and Bezier mesh generation (M3).
 //! - [`model`]: deterministic, renderer-independent summary of an E-mote PSB
 //!   tree (version, top-level sections, node counts, resource counts).
@@ -46,17 +49,23 @@
 pub mod anim;
 pub mod error;
 pub mod model;
+pub mod plan;
+pub mod pose;
 pub mod psb;
 pub mod render;
 pub mod schema;
+pub mod soft;
 pub mod texture;
 pub mod yuris;
 
 pub use anim::Animator;
 pub use error::EmoteError;
 pub use model::{ModelSummary, PsbNodeCounts};
+pub use plan::{DrawItem, RenderPlan};
+pub use pose::{FrameState, LayerPose, Pose};
 pub use psb::PsbDocument;
 pub use schema::Model;
+pub use soft::{RenderImage, SoftStats};
 pub use texture::DecodedTexture;
 pub use yuris::{Capability, EmoteArg, YurisEmote};
 

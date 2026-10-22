@@ -28,6 +28,9 @@
 │  texture  RGBA4444 atlas decode (A4R4G4B4 order)            │
 │   │                                                         │
 │  anim     variables, timelines, fades, deterministic clock  │
+│  pose     layer/frame evaluation, transforms, nested motions│
+│  plan     pose -> textured mesh draw list                   │
+│  soft     deterministic CPU rasterizer (baseline)           │
 │   │                                                         │
 │  render   58 WGSL variants, Bezier mesh tessellation        │
 │                                                             │
@@ -89,14 +92,17 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   visibility / normalization rules still need evidence. The source layout and
   filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
   behavior references; no code was copied.
-- **M2 (core done)** `Animator`: named variables, optional fades, timeline
-  playback/stop, looping, linear keyframe sampling, deterministic `tick`. The
-  official frame rate and non-zero easing curves still need oracle evidence;
-  the caller supplies the frame rate, and unsupported easing is held.
-- **M3 (core done)** all 58 official shader variants are committed as WGSL
-  files under `shaders/` (one file per official program index); a cubic Bezier
-  patch tessellator generates mesh grids. The wgpu pipeline and the runtime's
-  variant-selection rules are the remaining work.
+- **M2 (core done)** `Animator` for variables/timelines; `pose` evaluates
+  layer frame lists (type 0 hold, type 3 interpolation, `ti` quantization),
+  channel-wise `inheritMask`, `transformOrder`, nested type-3 motions and the
+  motion `priority` draw order. Alpha-mask/stencil composition is the remaining
+  visual gap; the official frame rate and non-zero easing still need oracle
+  evidence.
+- **M3 (baseline done)** all 58 official shader variants are committed as WGSL
+  files under `shaders/`; `plan` turns a pose into textured mesh draw items and
+  `soft` rasterizes it deterministically for validation/PNG output. The wgpu
+  pipeline, stencil/mask compositing and the runtime's variant-selection rules
+  are the remaining work.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.
 
