@@ -100,14 +100,18 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   motion-level `parameterize` (eyes/mouth/brows/tears/cheeks), and the native
   draw order: emission by `priority`, final sort by resolved Z. `psb-render`
   can play a timeline by name (`--timeline`, `--seconds`, `--loop`).
-  Parameterized deformer-mesh inheritance (`mesh_bp` on a blank layer warping
-  its children) is the remaining pose gap; non-zero easing and the official
-  frame rate still need oracle evidence.
+  Sprite meshes (`mesh.bp`) are inherited through shape sync
+  (`meshTransform == 1 && meshSyncChildMask & 8`) and combined by pointwise
+  displacement from identity; the patch is sampled in each sprite's own icon
+  box. Parameterized mesh combinators (`rawMeshList`) and coord/angle/zoom sync
+  remain; non-zero easing and the official frame rate still need oracle
+  evidence.
 - **M3 (baseline done)** all 58 official shader variants are committed as WGSL
   files under `shaders/`; `plan` turns a pose into textured mesh draw items and
   `soft` rasterizes it deterministically for validation/PNG output. Composite
   alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) are resolved
-  per motion scope and rasterized into coverage buffers. The wgpu pipeline,
+  per motion scope (type-3 sources expand to their nested player's sprites) and
+  rasterized into coverage buffers. The wgpu pipeline,
   pixelate pass and the runtime's shader-variant selection rules remain.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.

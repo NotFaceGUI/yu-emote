@@ -18,9 +18,9 @@ native + `wasm32` use.
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
 | Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
-| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order (`psb-pose`) | ✅ M2 core (parameterized deformer-mesh inheritance pending) |
+| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order, sprite-mesh (shape-sync) inheritance (`psb-pose`) | ✅ M2 core (parameterized mesh combinators, coord/angle/zoom sync pending) |
 | Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG) | ✅ M3 baseline |
-| Composite alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) in the CPU path | ✅ M3 core |
+| Composite alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`, type-3 source expansion) in the CPU path | ✅ M3 core |
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
@@ -127,9 +127,17 @@ are recorded here so the implementation can be audited against them:
   type-0 gap.
 - **Composite masks.** A type-12 layer with `stencilType & 4` and a non-empty
   `stencilCompositeMaskLayerList` clips its descendants by the union of the
-  named source layers (resolved in the same motion scope). The CPU renderer
-  rasterizes those sources into a coverage buffer; `add_mask` with opacity 0 is
-  not a source (matching the native visible-sprite filter).
+  named source layers (resolved in the owner's motion scope). A type-0 source
+  contributes its visible geometry; a type-3 source expands to the sprites
+  emitted by its nested player. The CPU renderer rasterizes those sources into
+  a coverage buffer; `add_mask` with opacity 0 is not a source (matching the
+  native visible-sprite filter).
+- **Sprite meshes.** `mesh.bp` is a 4x4 Bezier patch normalized to the drawn
+  sprite's icon box, not a world-space warp. A layer passes its accumulated
+  patch to children only when `meshTransform == 1` and
+  `meshSyncChildMask & 8` (shape sync); patches combine by pointwise
+  displacement from identity (`dst = next + (self - identity)`). This drives
+  the eyelid/iris, head, body, mouth and eyebrow deformers.
 - **YSEmote ABI.** The exported wrappers are **stdcall** (`RET imm`); declaring
   them `__cdecl` corrupts the stack after a few updates. Ordinal 254 calls
   player vtable `+0xd4` (`Update(seconds)`), ordinal 255 calls `+0xd8`, which

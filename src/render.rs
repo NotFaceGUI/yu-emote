@@ -469,10 +469,15 @@ pub fn vertex_wgsl(program: VertexProgram) -> &'static str {
 /// A 4x4 cubic Bezier patch in normalized local sprite space.
 ///
 /// `identity` uses `(col/3, row/3)`, matching the neutral mesh.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 pub struct MeshPatch {
     /// Control points, row-major.
     pub control_points: [[f32; 2]; 16],
+    /// Tessellation density carried by the patch producer.
+    ///
+    /// A parent proxy can tessellate a much finer grid than the textured
+    /// sprite that inherits the patch; `combined_with` keeps the maximum.
+    pub division: u32,
 }
 
 impl MeshPatch {
@@ -484,7 +489,10 @@ impl MeshPatch {
                 control_points[row * 4 + col] = [col as f32 / 3.0, row as f32 / 3.0];
             }
         }
-        Self { control_points }
+        Self {
+            control_points,
+            division: 1,
+        }
     }
 
     /// Build a patch from the flat `mesh.bp` list (32 floats).
@@ -503,6 +511,50 @@ impl MeshPatch {
             *point = [values[index * 2] as f32, values[index * 2 + 1] as f32];
         }
         patch
+    }
+
+    /// Set the tessellation density used when this patch deforms a sprite.
+    pub fn with_division(mut self, division: u32) -> Self {
+        self.division = self.division.max(division.max(1));
+        self
+    }
+
+    /// Combine an inherited patch with the current layer's patch.
+    ///
+    /// The native `meshCombine` path (`sub_1038B340`) does not compose the
+    /// two Bezier mappings. It adds each source control-point displacement
+    /// from the canonical identity mesh to the destination point-by-point:
+    ///
+    /// ```text
+    /// out[i] = next[i] + (self[i] - identity[i])
+    /// ```
+    ///
+    /// `self` is the accumulated ancestor patch and `next` is the layer's own
+    /// patch (eluna's `EmoteMeshPatch::combined_with`, evidenced against the
+    /// native function). All patches are normalized to the same sprite box,
+    /// so the displacement addition is well defined.
+    pub fn combined_with(&self, next: &MeshPatch) -> MeshPatch {
+        let identity = MeshPatch::identity();
+        let mut out = *next;
+        out.division = self.division.max(next.division);
+        for index in 0..16 {
+            out.control_points[index][0] +=
+                self.control_points[index][0] - identity.control_points[index][0];
+            out.control_points[index][1] +=
+                self.control_points[index][1] - identity.control_points[index][1];
+        }
+        out
+    }
+
+    /// Whether the patch is the neutral identity mapping within `epsilon`.
+    pub fn is_identity(&self, epsilon: f32) -> bool {
+        let identity = MeshPatch::identity();
+        self.control_points
+            .iter()
+            .zip(identity.control_points.iter())
+            .all(|(point, neutral)| {
+                (point[0] - neutral[0]).abs() <= epsilon && (point[1] - neutral[1]).abs() <= epsilon
+            })
     }
 
     /// Evaluate the bicubic Bezier patch at `(u, v)`.
@@ -616,6 +668,20 @@ mod tests {
             13
         );
         assert_eq!(VERTEX_PROGRAM_LIST.len(), 4);
+    }
+
+    #[test]
+    fn mesh_patch_combines_by_displacement() {
+        let identity = MeshPatch::identity();
+        assert!(identity.is_identity(0.0));
+        let mut patch = MeshPatch::identity();
+        patch.control_points[5] = [0.5, 0.1];
+        let combined = identity.combined_with(&patch);
+        assert_eq!(combined.control_points[5], [0.5, 0.1]);
+        // Combining a patch with itself accumulates its displacement twice.
+        let doubled = patch.combined_with(&patch);
+        assert!((doubled.control_points[5][0] - 2.0 / 3.0).abs() < 1e-6);
+        assert!((doubled.control_points[5][1] - (0.2 - 1.0 / 3.0)).abs() < 1e-6);
     }
 
     #[test]

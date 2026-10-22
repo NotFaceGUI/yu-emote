@@ -596,28 +596,18 @@ pub struct LayerPose {
     /// Motion scope this layer was evaluated in (nested motions get their own
     /// scope, so equal labels in the left/right eye never alias).
     pub scope: usize,
-    /// Ancestor deformer meshes that warp this layer's geometry, outermost
-    /// first. Each entry is applied leaf-to-root by the plan builder.
-    pub deformers: Vec<Deformer>,
+    /// Accumulated 4x4 Bezier sprite patch for this layer's own geometry.
+    ///
+    /// The native mesh chain (`sub_10353CF0`) folds every ancestor whose
+    /// `meshTransform == 1` and `meshSyncChildMask & 8` is set (shape sync)
+    /// into the child, combining patches by pointwise displacement addition
+    /// (`sub_1038B340`). The patch is normalized to the drawn sprite's icon
+    /// box; it is not a world-space warp.
+    pub mesh: Option<MeshPatch>,
     /// Draw-order key: rank path from `priority` frames.
     pub priority_path: Vec<i64>,
     /// Child layers.
     pub children: Vec<LayerPose>,
-}
-
-/// One ancestor 4x4 Bezier deformer (`mesh.bp` on a blank proxy layer).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Deformer {
-    /// Deformer local space -> world.
-    pub world: Affine2,
-    /// World -> deformer local space.
-    pub inverse: Affine2,
-    /// Deformer box width in local pixels (`icon` rect width).
-    pub width: f64,
-    /// Deformer box height in local pixels.
-    pub height: f64,
-    /// Flat row-major 4x4 control points (32 floats).
-    pub patch: Vec<f64>,
 }
 
 /// One composite alpha-mask owner (`stencilType & 4`).
@@ -629,6 +619,13 @@ pub struct MaskGroup {
     pub owner_scope: usize,
     /// `stencilCompositeMaskLayerList` labels.
     pub sources: Vec<String>,
+    /// Resolved source layer paths.
+    ///
+    /// A type-0/10 source contributes itself when it has visible geometry.
+    /// A type-3 source is not color geometry; the native resolver expands the
+    /// referenced nested player and contributes every emitted sprite below it
+    /// (`sub_10337560` + `sub_103390C0` second pass).
+    pub source_paths: Vec<String>,
 }
 
 /// A full motion pose at one time.
@@ -685,7 +682,7 @@ impl Pose {
             opacity: 1.0,
             visible: true,
             mask_group: None,
-            deformers: Vec::new(),
+            mesh: None,
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
@@ -711,14 +708,16 @@ impl Pose {
                 &mut counter,
             ));
         }
-        Self {
+        let mut pose = Self {
             object: object.to_string(),
             motion: motion_name.to_string(),
             time,
             variables: variables.clone(),
             mask_groups,
             layers,
-        }
+        };
+        resolve_mask_sources(&pose.layers, &mut pose.mask_groups);
+        pose
     }
 
     /// Flatten all visible drawable layers.
@@ -756,7 +755,8 @@ struct Context {
     opacity: f64,
     visible: bool,
     mask_group: Option<usize>,
-    deformers: Vec<Deformer>,
+    /// Accumulated ancestor sprite patch inherited through shape sync.
+    mesh: Option<MeshPatch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -844,16 +844,33 @@ fn evaluate_layer(
             owner_path: path.to_string(),
             owner_scope: scope,
             sources: layer.stencil_composite_mask_layer_list.clone(),
+            source_paths: Vec::new(),
         });
         child_mask_group = Some(id);
     }
 
-    // TODO(M2): parameterized deformer-mesh inheritance. The native chain
-    // applies `mesh.bp` in an absolute-mesh convention that is not yet
-    // evidenced; treating every blank proxy as a world-space warp tears the
-    // character apart. Keep the pose field but do not warp until the
-    // convention is proven.
-    let child_deformers = parent.deformers.clone();
+    // Native sprite-mesh inheritance (`sub_10353CF0` / `sub_1038B340`).
+    //
+    // A layer whose frame carries `mesh.bp` always draws its own sprite
+    // through that patch. Descendants additionally inherit the accumulated
+    // patch only when the layer is a shape-sync node
+    // (`meshTransform == 1` and `meshSyncChildMask & 8`); other sync bits
+    // only warp the child's coordinate/angle/scale (`sub_10335500`) and do
+    // not propagate the patch. Patches are combined by adding control-point
+    // displacement from identity, not by composing the Bezier mappings.
+    let own_mesh = state
+        .mesh_bp
+        .as_deref()
+        .filter(|bp| bp.len() >= 32)
+        .map(|bp| {
+            MeshPatch::from_bp(Some(bp)).with_division(layer.mesh_division.unwrap_or(1) as u32)
+        });
+    let self_mesh = combine_patch(parent.mesh, own_mesh);
+    // Native `sub_10353CF0` activates a mesh-chain node only for
+    // `meshTransform == 1`; bit 8 is the shape-sync half of the mask.
+    let shape_sync = layer.mesh_transform.unwrap_or(0) == 1
+        && layer.mesh_sync_child_mask.unwrap_or(0) & 0x8 != 0;
+    let child_mesh = if shape_sync { self_mesh } else { parent.mesh };
 
     let context = Context {
         world,
@@ -863,7 +880,7 @@ fn evaluate_layer(
         opacity,
         visible: visible_chain,
         mask_group: child_mask_group,
-        deformers: child_deformers,
+        mesh: child_mesh,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -963,7 +980,7 @@ fn evaluate_layer(
         stencil_type: layer.stencil_type.unwrap_or(0),
         mask_group: inherited_mask_group,
         scope,
-        deformers: parent.deformers.clone(),
+        mesh: self_mesh,
         priority_path,
         children,
     }
@@ -986,6 +1003,97 @@ fn map_coordinate(parent: &Context, coord: [f64; 3]) -> ([f64; 2], [f64; 3]) {
             parent.world_origin[2] + coord[2],
         ];
         ([origin[0], origin[1]], origin)
+    }
+}
+
+/// Fold an inherited sprite patch with a layer's own patch.
+///
+/// Native `meshCombine` (`sub_1038B340`) is pointwise displacement addition
+/// from identity, not Bezier composition; see
+/// [`MeshPatch::combined_with`].
+fn combine_patch(base: Option<MeshPatch>, own: Option<MeshPatch>) -> Option<MeshPatch> {
+    match (base, own) {
+        (Some(base), Some(own)) => Some(base.combined_with(&own)),
+        (None, own) => own,
+        (base, None) => base,
+    }
+}
+
+/// Resolve composite-mask source labels to concrete layer paths.
+///
+/// `stencilCompositeMaskLayerList` stores player-local layer labels. The
+/// native resolver (`sub_10337560`) finds the label in the owner's own
+/// motion scope and accepts only type-0/type-3 sources:
+///
+/// - a type-0 source contributes its own visible geometry;
+/// - a type-3 source is a proxy for a nested player, so the resolver expands
+///   the referenced motion and contributes every emitted sprite below it
+///   (recursively, including deeper nested players).
+///
+/// Blank proxies (such as the optional `add_mask` helper) have no geometry
+/// and therefore do not widen the mask.
+fn resolve_mask_sources(layers: &[LayerPose], groups: &mut [MaskGroup]) {
+    if groups.is_empty() {
+        return;
+    }
+    struct Source<'a> {
+        path: &'a str,
+        scope: usize,
+        label: &'a str,
+        kind: i64,
+        geometry: bool,
+    }
+    fn walk<'a>(layers: &'a [LayerPose], out: &mut Vec<Source<'a>>) {
+        for layer in layers {
+            let geometry = layer.visible
+                && layer.opacity > 0.0
+                && layer.drawable
+                && layer
+                    .state
+                    .src
+                    .as_deref()
+                    .is_some_and(|src| !src.is_empty() && src != "blank");
+            out.push(Source {
+                path: &layer.path,
+                scope: layer.scope,
+                label: &layer.label,
+                kind: layer.kind,
+                geometry,
+            });
+            walk(&layer.children, out);
+        }
+    }
+    let mut sources = Vec::new();
+    walk(layers, &mut sources);
+    for group in groups.iter_mut() {
+        let mut paths = Vec::new();
+        for label in &group.sources {
+            for source in sources
+                .iter()
+                .filter(|source| source.scope == group.owner_scope && source.label == label)
+            {
+                if source.kind == 3 {
+                    let prefix = format!("{}/@", source.path);
+                    for descendant in &sources {
+                        if descendant.geometry
+                            && descendant.path.starts_with(&prefix)
+                            && !paths
+                                .iter()
+                                .any(|path: &String| path.as_str() == descendant.path)
+                        {
+                            paths.push(descendant.path.to_string());
+                        }
+                    }
+                } else if source.geometry
+                    && !paths
+                        .iter()
+                        .any(|path: &String| path.as_str() == source.path)
+                {
+                    paths.push(source.path.to_string());
+                }
+            }
+        }
+        group.source_paths = paths;
     }
 }
 
@@ -1102,10 +1210,48 @@ mod tests {
             stencil_type: 0,
             mask_group: None,
             scope: 0,
-            deformers: Vec::new(),
+            mesh: None,
             priority_path: priority_path.to_vec(),
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mask_source_type3_expands_nested_sprites() {
+        let mut owner = drawable_layer("stencil", 0.0, &[0]);
+        owner.kind = 12;
+        owner.stencil_type = 5;
+
+        let mut proxy = drawable_layer("eye_proxy", 0.0, &[1]);
+        proxy.kind = 3;
+        proxy.drawable = false;
+        proxy.visible = false;
+
+        let mut iris = drawable_layer("iris", 0.0, &[2]);
+        iris.path = "eye_proxy/@face_parts:瞳孔/0".into();
+        iris.state.src = Some("tex".into());
+
+        let mut nested_blank = drawable_layer("blank_proxy", 0.0, &[3]);
+        nested_blank.path = "eye_proxy/@face_parts:瞳孔/1".into();
+        nested_blank.state.src = Some("blank".into());
+
+        let mut direct = drawable_layer("shirome", 0.0, &[4]);
+        direct.state.src = Some("tex".into());
+
+        let mut groups = vec![MaskGroup {
+            owner_path: "stencil".into(),
+            owner_scope: 0,
+            sources: vec!["eye_proxy".into(), "shirome".into()],
+            source_paths: Vec::new(),
+        }];
+        resolve_mask_sources(&[owner, proxy, iris, nested_blank, direct], &mut groups);
+        assert_eq!(
+            groups[0].source_paths,
+            vec![
+                "eye_proxy/@face_parts:瞳孔/0".to_string(),
+                "shirome".to_string(),
+            ]
+        );
     }
 
     #[test]

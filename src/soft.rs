@@ -360,9 +360,9 @@ fn render_with_textures(
         let mut buffer = vec![0.0f32; width as usize * height as usize];
         let mut source_count = 0usize;
         for item in &plan.items {
-            if item.scope != group.owner_scope
-                || !group.sources.iter().any(|label| label == &item.label)
-            {
+            // Source paths were resolved in the pose (own scope; type-3
+            // proxies expand to their nested player's emitted sprites).
+            if !group.source_paths.iter().any(|path| path == &item.path) {
                 continue;
             }
             let Some(texture) = textures.get(&item.page) else {
