@@ -87,8 +87,9 @@ library; tests read it from `YURIS_EMOTE_KEY`.
 
 ## Milestones
 
-- **M1 (data extraction done)** typed PSB schema (`schema`), `RGBA4444` atlas
-  decoding (`texture`), deterministic `psb-dump`, sample-backed tests. Part
+- **M1 (data extraction done)** typed PSB schema (`schema`), `RGBA4444`
+  (v2 multi-page) and `RGBA8` (v4 `ems` single-page) atlas decoding
+  (`texture`), deterministic `psb-dump`, sample-backed tests. Part
   visibility / normalization rules still need evidence. The source layout and
   filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
   behavior references; no code was copied.

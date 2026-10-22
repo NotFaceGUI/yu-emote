@@ -106,6 +106,32 @@ pub fn decode_rgba4444(
     })
 }
 
+/// Decode a tightly packed `RGBA8` page (PSB v4 `texture/type == "RGBA8"`).
+///
+/// # Errors
+///
+/// Returns [`EmoteError::TextureSizeMismatch`] when the buffer length is not
+/// exactly `width * height * 4`.
+pub fn decode_rgba8(bytes: &[u8], width: u32, height: u32) -> Result<DecodedTexture, EmoteError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(EmoteError::TextureSizeOverflow { width, height })?;
+    if bytes.len() != expected {
+        return Err(EmoteError::TextureSizeMismatch {
+            width,
+            height,
+            expected,
+            actual: bytes.len(),
+        });
+    }
+    Ok(DecodedTexture {
+        width,
+        height,
+        rgba8: bytes.to_vec(),
+    })
+}
+
 /// Decode one atlas page from a parsed document.
 ///
 /// # Errors
@@ -124,7 +150,7 @@ pub fn decode_page(
         .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
             format: "<missing>".into(),
         })?;
-    if format != "RGBA4444" {
+    if format != "RGBA4444" && format != "RGBA8" {
         return Err(EmoteError::UnsupportedTextureFormat {
             format: format.to_string(),
         });
@@ -141,7 +167,11 @@ pub fn decode_page(
                 page: source.name.clone(),
                 index: Some(index),
             })?;
-    decode_rgba4444(bytes, source.width, source.height)
+    if format == "RGBA8" {
+        decode_rgba8(bytes, source.width, source.height)
+    } else {
+        decode_rgba4444(bytes, source.width, source.height)
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +197,12 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rgba8_pages_copy_bytes() {
+        let decoded = decode_rgba8(&[1, 2, 3, 4, 5, 6, 7, 8], 2, 1).unwrap();
+        assert_eq!(decoded.rgba8, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(decoded.pixel(1, 0), Some([5, 6, 7, 8]));
     }
 }

@@ -762,7 +762,7 @@ impl Model {
         if let Some(source) = field(root, "source") {
             let mut pages: Vec<_> = obj_or_empty(Some(source))
                 .iter()
-                .filter(|(name, _)| name.starts_with("tex#"))
+                .filter(|(name, _)| name.starts_with("tex#") || name.as_str() == "tex")
                 .map(|(name, page)| texture_source(name, page))
                 .collect();
             pages.sort_by(|a, b| a.name.cmp(&b.name));

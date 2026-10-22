@@ -37,5 +37,12 @@ official code or shader source was copied; the WGSL in `src/render.rs` is an
 independent description of the observed program semantics; the WGSL files
 under `shaders/` are generated from the feature table in `src/render.rs`.
 
+Game assets used for local verification (the YU-RIS `emote_test.psb` and the
+Nekopara `*.pure.psb` files mirrored by Chocola-X/NekoWebShow) remain the
+property of their respective rights holders. They are not included in this
+repository, its packages, or its generated demo HTML; only the renderer and the
+demo generator are distributed.
+
 E-mote is a product of M2 Co., Ltd. This project is not affiliated with,
-endorsed by, or sponsored by M2.
+endorsed by, or sponsored by M2. Nekopara is a product of NEKO WORKs; this
+project is not affiliated with NEKO WORKs.

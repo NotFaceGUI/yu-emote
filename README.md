@@ -12,6 +12,7 @@ native + `wasm32` use.
 |---|---|
 | PSB/MDF container parsing (via MIT `emote-psb`) | ✅ |
 | Body decryption (E-mote key) + key search | ✅ (per-game key, not shipped) |
+| PSB v4 `ems` sources (`source/tex`, one `RGBA8` page, 4-digit icons) | ✅ |
 | Deterministic model summary (`psb-info`) | ✅ |
 | YU-RIS adapter: `EMOTE` params, `EMOTEINFO` queries, capability, suspend/dirty | ✅ |
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
@@ -23,11 +24,11 @@ native + `wasm32` use.
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
-The renderer is usable today for the official test model: a real-game
-`emote_test.psb` produces a complete character with correct rear-hair/face/front-
-hair layering and variable-driven expressions. [`demo/make_demo.py`](demo/make_demo.py)
-builds a self-contained demo page (`target/emote-demo/index.html`) from 11
-rendered poses.
+The renderer is usable today for real game data: the YU-RIS test model and
+four Nekopara maid models produce complete characters with correct
+rear-hair/face/front-hair layering and variable-driven expressions.
+[`demo/make_demo.py`](demo/make_demo.py) builds a self-contained character +
+expression demo page (`target/emote-demo/index.html`) from those models.
 
 ## Usage
 
@@ -52,9 +53,12 @@ cargo run --bin psb-render -- model.psb --key 0x175058c9 --time 0 --out out.png
 cargo run --bin psb-render -- model.psb --key 0x175058c9 --time 0 \
   --var face_mouth=30 --var face_eyebrow=40 --out smile.png
 
-# Self-contained demo page (11 poses embedded as PNG)
+# Self-contained demo page (character + expression selector)
 cargo build --bins
-python demo/make_demo.py --psb /path/to/emote_test.psb --key 0x175058c9
+python demo/make_demo.py \
+  --model "ERIS テスト=/path/to/emote_test.psb" \
+  --model "ショコラ=/path/to/chocola-maid.pure.psb" \
+  --model "バニラ=/path/to/vanilla-maid.pure.psb"
 # → target/emote-demo/index.html
 ```
 
@@ -63,6 +67,14 @@ Verified against the YU-RIS ERIS sample `emote_test.psb` (PSB v2, body key
 `RGBA4444`), 6 objects, 21 motions, 234 layers, 888 layer keyframes, 24
 variables, 11 timelines. The key is data-specific and is **not** hardcoded in
 the library.
+
+Also verified against four Nekopara maid models (`chocola`, `vanilla`,
+`azuki`, `coconut`) mirrored by
+[`Chocola-X/NekoWebShow`](https://github.com/Chocola-X/NekoWebShow): PSB **v4**
+(`spec: ems`), one 4096x4096 `RGBA8` atlas under `source/tex`, 87 icons,
+21 objects / 48 motions, 34 draw items / 25,472 triangles at the base motion.
+The game assets are used locally for testing and are **not redistributed** in
+this repository or its demo output.
 
 ## Evidence-backed facts
 
@@ -88,6 +100,11 @@ are recorded here so the implementation can be audited against them:
   ordinal 3 = `EmoteFilterTexture`; ordinals 101..121 call the device vtable
   slots `+0x00..+0x50`, ordinals 201..256 call the player vtable slots
   `+0x00..+0xdc`. The engine's loader stores them at `yu-ris.exe` `0x801384..`.
+- **PSB v4 `ems` shape.** Nekopara models use `source: {"tex": {...}}` (not
+  `tex#0`/`tex#1`), icons keyed by four-digit strings (`"0020"`), and
+  `texture/type == "RGBA8"` with a single 4096² resource. The decoder accepts
+  both the v2 `RGBA4444` multi-page layout and the v4 `RGBA8` single-page
+  layout.
 - **Contracts.** `EMOTE` resolves the character, then applies named string /
   flag / numeric variables; numeric fades are converted with `value * 0.06`
   before reaching the player. `EMOTEINFO` calls player slot 45. Details and
