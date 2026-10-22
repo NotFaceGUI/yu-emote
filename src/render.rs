@@ -478,6 +478,12 @@ pub struct MeshPatch {
     /// A parent proxy can tessellate a much finer grid than the textured
     /// sprite that inherits the patch; `combined_with` keeps the maximum.
     pub division: u32,
+    /// Optional mesh-sync domain `[left, top, width, height]` in local pixels.
+    ///
+    /// Frames whose `icon` is `width:height:originX:originY` define this from
+    /// the icon box; it is used only by `meshSyncChildMask` coordinate/angle/
+    /// scale sync, not by sprite tessellation.
+    pub domain: Option<[f32; 4]>,
 }
 
 impl MeshPatch {
@@ -492,6 +498,7 @@ impl MeshPatch {
         Self {
             control_points,
             division: 1,
+            domain: None,
         }
     }
 
@@ -519,6 +526,14 @@ impl MeshPatch {
         self
     }
 
+    /// Attach the mesh-sync domain when the patch does not carry one.
+    pub fn with_domain(mut self, domain: Option<[f32; 4]>) -> Self {
+        if self.domain.is_none() {
+            self.domain = domain;
+        }
+        self
+    }
+
     /// Combine an inherited patch with the current layer's patch.
     ///
     /// The native `meshCombine` path (`sub_1038B340`) does not compose the
@@ -537,6 +552,7 @@ impl MeshPatch {
         let identity = MeshPatch::identity();
         let mut out = *next;
         out.division = self.division.max(next.division);
+        out.domain = self.domain.or(next.domain);
         for index in 0..16 {
             out.control_points[index][0] +=
                 self.control_points[index][0] - identity.control_points[index][0];
@@ -544,6 +560,23 @@ impl MeshPatch {
                 self.control_points[index][1] - identity.control_points[index][1];
         }
         out
+    }
+
+    /// Interpolate two patches control-point by control-point.
+    pub fn interpolate(a: &MeshPatch, b: &MeshPatch, t: f32) -> MeshPatch {
+        let t = t.clamp(0.0, 1.0);
+        let mut control_points = a.control_points;
+        for (index, point) in control_points.iter_mut().enumerate() {
+            point[0] = a.control_points[index][0]
+                + (b.control_points[index][0] - a.control_points[index][0]) * t;
+            point[1] = a.control_points[index][1]
+                + (b.control_points[index][1] - a.control_points[index][1]) * t;
+        }
+        MeshPatch {
+            control_points,
+            division: a.division.max(b.division),
+            domain: a.domain.or(b.domain),
+        }
     }
 
     /// Whether the patch is the neutral identity mapping within `epsilon`.

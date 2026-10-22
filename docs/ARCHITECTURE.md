@@ -103,15 +103,18 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   Sprite meshes (`mesh.bp`) are inherited through shape sync
   (`meshTransform == 1 && meshSyncChildMask & 8`) and combined by pointwise
   displacement from identity; the patch is sampled in each sprite's own icon
-  box. Parameterized mesh combinators (`rawMeshList`) and coord/angle/zoom sync
-  remain; non-zero easing and the official frame rate still need oracle
-  evidence.
+  box. `meshSyncChildMask` bits 0x1/0x2/0x4 warp child coordinate/angle/scale,
+  and `meshCombinator.combinatorList` interpolates `rawMeshList` resources by
+  variable. Inheritance follows the native transparent-source (`0x400000`)
+  walk with motion-root compensation. Non-zero easing and the official frame
+  rate still need oracle evidence.
 - **M3 (baseline done)** all 58 official shader variants are committed as WGSL
   files under `shaders/`; `plan` turns a pose into textured mesh draw items and
   `soft` rasterizes it deterministically for validation/PNG output. Composite
   alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) are resolved
   per motion scope (type-3 sources expand to their nested player's sprites) and
-  rasterized into coverage buffers. The wgpu pipeline,
+  rasterized into coverage buffers. The native blend table (`sub_1041A190`,
+  modes 0..5) and MODULATE2X are applied per pixel. The wgpu pipeline,
   pixelate pass and the runtime's shader-variant selection rules remain.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.

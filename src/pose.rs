@@ -102,7 +102,7 @@ impl Default for FrameState {
             scale: [1.0; 2],
             rotation_deg: 0.0,
             shear: [0.0; 2],
-            color: [0xFFFF_FFFF; 4],
+            color: [0x8080_80FF; 4],
             opacity: 255.0,
             mask: 0,
             src: None,
@@ -172,6 +172,12 @@ impl FrameState {
         }
         if let Some(color) = content.color {
             self.color = color;
+        } else if (self.blend_mode & 0xF0) == 0 {
+            // sub_1033D0E0: legacy non-MODULATE2X frames default to white;
+            // MODULATE2X frames use the neutral 0x80 gray that doubles to 1.
+            self.color = [0xFFFF_FFFF; 4];
+        } else {
+            self.color = [0x8080_80FF; 4];
         }
         if let Some(mesh) = &content.mesh {
             if let Some(bp) = &mesh.bp {
@@ -557,6 +563,259 @@ fn inherit_state(own: LinearState, parent: LinearState, mask: i64) -> LinearStat
     }
 }
 
+/// Mesh-sync domain from the layer's first authored blank icon.
+///
+/// Blank icons are `width:height:originX:originY`; the native domain is
+/// `[-originX, -originY, width, height]` (`parse_mesh_domain_icon`).
+fn layer_mesh_domain(layer: &Layer) -> Option<[f32; 4]> {
+    layer
+        .frames
+        .iter()
+        .filter_map(|frame| frame.content.as_ref())
+        .filter_map(|content| content.mesh.as_ref())
+        .filter_map(|_| {
+            layer
+                .frames
+                .iter()
+                .filter_map(|frame| frame.content.as_ref())
+                .filter_map(|content| content.icon.as_ref())
+                .filter_map(|icon| icon.rect)
+                .next()
+        })
+        .next()
+        .and_then(|rect| {
+            let [width, height, origin_x, origin_y] = rect;
+            (width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0).then_some([
+                -origin_x as f32,
+                -origin_y as f32,
+                width as f32,
+                height as f32,
+            ])
+        })
+}
+
+struct MeshCombinatorEval {
+    self_patch: Option<MeshPatch>,
+    child_patch: Option<MeshPatch>,
+}
+
+fn layer_parameter_key(
+    layer: &Layer,
+    parameters: &[crate::schema::ParameterDef],
+) -> Option<String> {
+    match layer.parameterize.as_ref()? {
+        ParameterRef::Index(index) if *index >= 0 => parameters
+            .get(*index as usize)
+            .and_then(|parameter| parameter.id.clone()),
+        ParameterRef::Inline(value) => value
+            .get("id")
+            .and_then(|id| id.as_str())
+            .map(str::to_owned),
+        _ => None,
+    }
+}
+
+/// Evaluate `meshCombinator.combinatorList` for one layer.
+///
+/// The first entry is a self patch when it matches the layer's own
+/// `parameterize` key (or when the layer has no parameter); every following
+/// entry is a child patch and is authored as a displacement from identity.
+fn evaluate_mesh_combinator(
+    combinator: &crate::schema::MeshCombinator,
+    layer: &Layer,
+    parameters: &[crate::schema::ParameterDef],
+    variables: &BTreeMap<String, f64>,
+) -> Option<MeshCombinatorEval> {
+    let first = combinator.entries.first()?;
+    let parent_key = layer_parameter_key(layer, parameters);
+    let restore_first_to_parent = match (parent_key.as_deref(), first.key.as_deref()) {
+        (None, _) => true,
+        (Some("param"), _) => true,
+        (Some(parent), Some(first)) => parent == first,
+        (Some(_), None) => false,
+    };
+    let domain = layer_mesh_domain(layer);
+    let division = layer.mesh_division.unwrap_or(1).max(1) as u32;
+    let mut self_patch = None;
+    let mut child_patch = None;
+    let mut start = 0usize;
+    if restore_first_to_parent {
+        if let Some(patch) = evaluate_one_mesh_combinator(first, false, variables, division, domain)
+        {
+            self_patch = Some(patch);
+            start = 1;
+        }
+    }
+    for entry in combinator.entries.iter().skip(start) {
+        if let Some(patch) = evaluate_one_mesh_combinator(entry, true, variables, division, domain)
+        {
+            child_patch = combine_patch(child_patch, Some(patch));
+        }
+    }
+    (self_patch.is_some() || child_patch.is_some()).then_some(MeshCombinatorEval {
+        self_patch,
+        child_patch,
+    })
+}
+
+fn evaluate_one_mesh_combinator(
+    entry: &crate::schema::MeshCombinatorEntry,
+    delta: bool,
+    variables: &BTreeMap<String, f64>,
+    division: u32,
+    domain: Option<[f32; 4]>,
+) -> Option<MeshPatch> {
+    let key = entry.key.as_deref()?;
+    let mesh_count = entry.mesh_count.max(1);
+    let begin = entry.range_begin;
+    let end = entry.range_end;
+    let neutral = if begin <= 0.0 && end >= 0.0 {
+        0.0
+    } else {
+        (begin + end) * 0.5
+    };
+    let value = variables.get(key).copied().unwrap_or(neutral);
+    let position = if mesh_count <= 1
+        || !begin.is_finite()
+        || !end.is_finite()
+        || (end - begin).abs() <= f64::EPSILON
+    {
+        0.0
+    } else {
+        ((value - begin) / (end - begin)).clamp(0.0, 1.0) * (mesh_count as f64 - 1.0)
+    };
+    let i0 = position.floor() as usize;
+    let i1 = (position.ceil() as usize).min(mesh_count - 1);
+    let t = (position - i0 as f64) as f32;
+
+    let patch_at = |index: usize| -> Option<MeshPatch> {
+        if entry.neutral_index == index as i64 {
+            return Some(
+                MeshPatch::identity()
+                    .with_division(division)
+                    .with_domain(domain),
+            );
+        }
+        let values = entry.values.get(index)?;
+        let mut patch = MeshPatch::identity();
+        for (slot, point) in patch.control_points.iter_mut().enumerate() {
+            let mut x = values[slot * 2];
+            let mut y = values[slot * 2 + 1];
+            if delta {
+                x += (slot % 4) as f32 / 3.0;
+                y += (slot / 4) as f32 / 3.0;
+            }
+            *point = [x, y];
+        }
+        Some(patch.with_division(division).with_domain(domain))
+    };
+    let p0 = patch_at(i0)?;
+    let p1 = patch_at(i1)?;
+    Some(MeshPatch::interpolate(&p0, &p1, t).with_domain(domain))
+}
+
+/// Warp a child's authored coordinate/angle/scale through a parent's
+/// shape-synced mesh (`sub_10335500`).
+fn apply_mesh_sync_child_state(state: &mut FrameState, sync: MeshSyncState, inherit_mask: i64) {
+    let Some([left, top, width, height]) = sync.patch.domain else {
+        return;
+    };
+    if !width.is_finite()
+        || !height.is_finite()
+        || width.abs() <= f32::EPSILON
+        || height.abs() <= f32::EPSILON
+    {
+        return;
+    }
+    let use_xz = sync.coordinate != 0;
+    let point = if use_xz {
+        [state.coord[0] as f32, state.coord[2] as f32]
+    } else {
+        [state.coord[0] as f32, state.coord[1] as f32]
+    };
+    let warp = |point: [f32; 2]| -> [f32; 2] {
+        let u = (point[0] - left) / width;
+        let v = (point[1] - top) / height;
+        let mapped = sync.patch.sample(u, v);
+        [left + mapped[0] * width, top + mapped[1] * height]
+    };
+    let mapped = warp(point);
+
+    const EPS: f32 = 0.0001;
+    let xm = warp([point[0] - EPS, point[1]]);
+    let xp = warp([point[0] + EPS, point[1]]);
+    let ym = warp([point[0], point[1] - EPS]);
+    let yp = warp([point[0], point[1] + EPS]);
+
+    if sync.mask & 0x2 != 0 && inherit_mask & 0x10 != 0 {
+        let dx = [xp[0] - xm[0], xp[1] - xm[1]];
+        let dy = [yp[0] - ym[0], yp[1] - ym[1]];
+        if dx[0].is_finite() && dx[1].is_finite() && dy[0].is_finite() && dy[1].is_finite() {
+            let ax = dx[1].atan2(dx[0]);
+            let ay = (-dy[0]).atan2(dy[1]);
+            state.rotation_deg += ((ax + ay) * 0.5).to_degrees() as f64;
+        }
+    }
+
+    if sync.mask & 0x4 != 0 && inherit_mask & 0x60 != 0 {
+        let triangle_area = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
+            (((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).abs()) * 0.5
+        };
+        let area = triangle_area(xm, xp, ym) + triangle_area(xm, xp, yp);
+        let scale = (2.0 * area).sqrt() / (2.0 * EPS);
+        if scale.is_finite() {
+            if inherit_mask & 0x20 != 0 {
+                state.scale[0] *= scale as f64;
+            }
+            if inherit_mask & 0x40 != 0 {
+                state.scale[1] *= scale as f64;
+            }
+        }
+    }
+
+    if sync.mask & 0x1 != 0 {
+        state.coord[0] = mapped[0] as f64;
+        if use_xz {
+            state.coord[2] = mapped[1] as f64;
+        } else {
+            state.coord[1] = mapped[1] as f64;
+        }
+    }
+}
+
+/// Remove the motion-root contribution from a partially-inherited state.
+///
+/// Native `sub_10331060` removes only the channels selected by `inheritMask`,
+/// builds the relative matrix, and reapplies the root matrix outside it.
+fn remove_motion_root_linear_state(
+    mut state: LinearState,
+    root: LinearState,
+    mask: i64,
+) -> LinearState {
+    if (mask & 0x4) != 0 {
+        state.flip_x ^= root.flip_x;
+    }
+    if (mask & 0x8) != 0 {
+        state.flip_y ^= root.flip_y;
+    }
+    if (mask & 0x10) != 0 {
+        state.rotation_deg -= root.rotation_deg;
+    }
+    if (mask & 0x20) != 0 && root.scale[0].abs() > f64::EPSILON {
+        state.scale[0] /= root.scale[0];
+    }
+    if (mask & 0x40) != 0 && root.scale[1].abs() > f64::EPSILON {
+        state.scale[1] /= root.scale[1];
+    }
+    if (mask & 0x80) != 0 {
+        state.shear[0] -= root.shear[0];
+    }
+    if (mask & 0x100) != 0 {
+        state.shear[1] -= root.shear[1];
+    }
+    state
+}
+
 /// One layer in the evaluated pose.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LayerPose {
@@ -675,14 +934,12 @@ impl Pose {
         variables: &BTreeMap<String, f64>,
     ) -> Self {
         let root = Context {
-            world: Affine2::identity(),
-            world_origin: [0.0; 3],
-            linear_state: LinearState::default(),
-            coordinate: 0,
-            opacity: 1.0,
             visible: true,
             mask_group: None,
             mesh: None,
+            source: InheritSource::root(),
+            motion_root: InheritSource::root(),
+            motion_independent: false,
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
@@ -747,16 +1004,57 @@ impl Pose {
     }
 }
 
-struct Context {
-    world: Affine2,
-    world_origin: [f64; 3],
+/// Ancestor state selected by the native `inheritParent` walk.
+///
+/// A layer whose `inheritMask` carries `0x400000` is transparent for
+/// inheritance: its descendants keep using the first ancestor above that
+/// transparent chain. The source stores the linear block, accumulated linear
+/// channels, XYZ location and coordinate plane separately, exactly like the
+/// native player (`sub_10331060`).
+#[derive(Debug, Clone, Copy)]
+struct MeshSyncState {
+    patch: MeshPatch,
+    mask: i64,
+    coordinate: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InheritSource {
+    linear: Affine2,
     linear_state: LinearState,
+    location: [f64; 3],
     coordinate: i64,
     opacity: f64,
+    mesh_sync: Option<MeshSyncState>,
+}
+
+impl InheritSource {
+    fn root() -> Self {
+        Self {
+            linear: Affine2::identity(),
+            linear_state: LinearState::default(),
+            location: [0.0; 3],
+            coordinate: 0,
+            opacity: 1.0,
+            mesh_sync: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Context {
     visible: bool,
     mask_group: Option<usize>,
     /// Accumulated ancestor sprite patch inherited through shape sync.
     mesh: Option<MeshPatch>,
+    /// Ancestor used by this layer's own inheritance.
+    source: InheritSource,
+    /// Synthetic root of the current motion player, used for partial-inherit
+    /// root compensation.
+    motion_root: InheritSource,
+    /// `motionIndependentLayerInherit` of the nested player that owns this
+    /// context.
+    motion_independent: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -789,10 +1087,18 @@ fn evaluate_layer(
         variables,
     )
     .unwrap_or(fallback_time);
-    let state = evaluate_frames(&layer.frames, sample_time, None);
     let inherit_mask = layer.inherit_mask.unwrap_or(0);
+    let mut state = evaluate_frames(&layer.frames, sample_time, None);
+    if let Some(sync) = parent.source.mesh_sync {
+        apply_mesh_sync_child_state(&mut state, sync, inherit_mask);
+    }
+    // Opacity uses the selected inheritance source (`sub_10331060`), not the
+    // direct parent. Transparent (0x400000) parents must not multiply their
+    // own opacity into descendants.
     let base_opacity = if (inherit_mask & INHERIT_OPACITY) != 0 {
-        parent.opacity
+        parent.source.opacity
+    } else if !parent.motion_independent {
+        parent.motion_root.opacity
     } else {
         1.0
     };
@@ -805,26 +1111,35 @@ fn evaluate_layer(
         scale: state.scale,
         shear: state.shear,
     };
-    let inherited = inherit_state(own, parent.linear_state, inherit_mask);
+    let source = parent.source;
+    let inherited = inherit_state(own, source.linear_state, inherit_mask);
+    let own_linear = build_linear(&layer.transform_order, own);
     let linear = if (inherit_mask & INHERIT_LINEAR_ALL) == INHERIT_LINEAR_ALL {
-        build_linear(&layer.transform_order, own)
+        // Native fast path: ancestor matrix followed by the local matrix.
+        source.linear.then(own_linear)
+    } else if !parent.motion_independent {
+        // Partial inheritance: remove the motion-root channels from the
+        // composite state, build the relative matrix, then reapply the root
+        // matrix as an outer transform.
+        let relative = remove_motion_root_linear_state(
+            inherited,
+            parent.motion_root.linear_state,
+            inherit_mask,
+        );
+        let relative_linear = build_linear(&layer.transform_order, relative);
+        parent.motion_root.linear.then(relative_linear)
     } else {
         build_linear(&layer.transform_order, inherited)
     };
-    let local = linear;
-    let (mapped, world_origin) = map_coordinate(parent, state.coord);
-    let world_linear = if (inherit_mask & INHERIT_LINEAR_ALL) == INHERIT_LINEAR_ALL {
-        parent.world.then(local)
-    } else {
-        local
-    };
+    let local = own_linear;
+    let world_origin = map_coordinate(source, state.coord);
     let world = Affine2 {
-        m11: world_linear.m11,
-        m12: world_linear.m12,
-        m21: world_linear.m21,
-        m22: world_linear.m22,
-        tx: mapped[0],
-        ty: mapped[1],
+        m11: linear.m11,
+        m12: linear.m12,
+        m21: linear.m21,
+        m22: linear.m22,
+        tx: world_origin[0],
+        ty: world_origin[1],
     };
 
     let drawable = matches!(layer.kind, 0 | 10 | 12);
@@ -863,24 +1178,71 @@ fn evaluate_layer(
         .as_deref()
         .filter(|bp| bp.len() >= 32)
         .map(|bp| {
-            MeshPatch::from_bp(Some(bp)).with_division(layer.mesh_division.unwrap_or(1) as u32)
+            MeshPatch::from_bp(Some(bp))
+                .with_division(layer.mesh_division.unwrap_or(1) as u32)
+                .with_domain(layer_mesh_domain(layer))
         });
-    let self_mesh = combine_patch(parent.mesh, own_mesh);
+    let combinator = layer.mesh_combinator.as_ref().and_then(|combinator| {
+        evaluate_mesh_combinator(combinator, layer, motion_parameters, variables)
+    });
+    let self_mesh = combine_patch(
+        combine_patch(parent.mesh, own_mesh),
+        combinator.as_ref().and_then(|value| value.self_patch),
+    );
     // Native `sub_10353CF0` activates a mesh-chain node only for
     // `meshTransform == 1`; bit 8 is the shape-sync half of the mask.
     let shape_sync = layer.mesh_transform.unwrap_or(0) == 1
         && layer.mesh_sync_child_mask.unwrap_or(0) & 0x8 != 0;
-    let child_mesh = if shape_sync { self_mesh } else { parent.mesh };
+    let child_mesh = if shape_sync {
+        combine_patch(
+            self_mesh,
+            combinator.as_ref().and_then(|value| value.child_patch),
+        )
+    } else {
+        parent.mesh
+    };
 
+    let current_coordinate = layer.coordinate.unwrap_or(0);
+    // A layer with inheritMask bit 0x400000 is transparent: descendants keep
+    // the source that this layer itself inherited from.
+    let child_source = if inherit_mask & 0x400000 != 0 {
+        parent.source
+    } else {
+        InheritSource {
+            linear: Affine2 {
+                m11: linear.m11,
+                m12: linear.m12,
+                m21: linear.m21,
+                m22: linear.m22,
+                tx: 0.0,
+                ty: 0.0,
+            },
+            linear_state: inherited,
+            location: world_origin,
+            coordinate: current_coordinate,
+            opacity,
+            mesh_sync: if layer.mesh_transform.unwrap_or(0) == 1
+                && layer.mesh_sync_child_mask.unwrap_or(0) & 0x7 != 0
+            {
+                self_mesh
+                    .filter(|patch| patch.domain.is_some())
+                    .map(|patch| MeshSyncState {
+                        patch,
+                        mask: layer.mesh_sync_child_mask.unwrap_or(0) & 0x7,
+                        coordinate: current_coordinate,
+                    })
+            } else {
+                None
+            },
+        }
+    };
     let context = Context {
-        world,
-        world_origin,
-        linear_state: inherited,
-        coordinate: layer.coordinate.unwrap_or(0),
-        opacity,
         visible: visible_chain,
         mask_group: child_mask_group,
         mesh: child_mesh,
+        source: child_source,
+        motion_root: parent.motion_root,
+        motion_independent: parent.motion_independent,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -938,6 +1300,29 @@ fn evaluate_layer(
                 let nested_ranks = nested.priority_ranks(child_time);
                 let nested_scope = *next_scope;
                 *next_scope += 1;
+                // A nested type-3 layer owns a fresh native MMotionPlayer. Its
+                // synthetic root is the enclosing layer's current composite
+                // state (`sub_1033ED90` / `apply_motion_layer_inherit`).
+                let nested_root = InheritSource {
+                    linear: Affine2 {
+                        m11: world.m11,
+                        m12: world.m12,
+                        m21: world.m21,
+                        m22: world.m22,
+                        tx: 0.0,
+                        ty: 0.0,
+                    },
+                    linear_state: inherited,
+                    location: world_origin,
+                    coordinate: current_coordinate,
+                    opacity,
+                    mesh_sync: None,
+                };
+                let mut nested_context = context.clone();
+                nested_context.source = nested_root;
+                nested_context.motion_root = nested_root;
+                nested_context.motion_independent =
+                    layer.motion_independent_layer_inherit.unwrap_or(0) != 0;
                 let mut nested_counter = 0i64;
                 for (index, nested_layer) in nested.layers.iter().enumerate() {
                     children.push(evaluate_layer(
@@ -946,7 +1331,7 @@ fn evaluate_layer(
                         &format!("{path}/@{}:{}/{}", object_name, icon.raw, index),
                         child_time,
                         variables,
-                        &context,
+                        &nested_context,
                         depth + 1,
                         &nested_ranks,
                         &nested.parameters,
@@ -986,23 +1371,23 @@ fn evaluate_layer(
     }
 }
 
-fn map_coordinate(parent: &Context, coord: [f64; 3]) -> ([f64; 2], [f64; 3]) {
-    if parent.coordinate != 0 {
-        let mapped = parent.world.apply_linear([coord[0], coord[2]]);
-        let origin = [
-            parent.world_origin[0] + mapped[0],
-            parent.world_origin[1] + coord[1],
-            parent.world_origin[2] + mapped[1],
-        ];
-        ([origin[0], origin[1]], origin)
+fn map_coordinate(source: InheritSource, coord: [f64; 3]) -> [f64; 3] {
+    // `sub_10331060` maps XY for coordinate==0 and XZ otherwise; the selected
+    // source's location is added afterwards.
+    if source.coordinate != 0 {
+        let mapped = source.linear.apply_linear([coord[0], coord[2]]);
+        [
+            source.location[0] + mapped[0],
+            source.location[1] + coord[1],
+            source.location[2] + mapped[1],
+        ]
     } else {
-        let mapped = parent.world.apply_linear([coord[0], coord[1]]);
-        let origin = [
-            parent.world_origin[0] + mapped[0],
-            parent.world_origin[1] + mapped[1],
-            parent.world_origin[2] + coord[2],
-        ];
-        ([origin[0], origin[1]], origin)
+        let mapped = source.linear.apply_linear([coord[0], coord[1]]);
+        [
+            source.location[0] + mapped[0],
+            source.location[1] + mapped[1],
+            source.location[2] + coord[2],
+        ]
     }
 }
 
@@ -1214,6 +1599,85 @@ mod tests {
             priority_path: priority_path.to_vec(),
             children: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mesh_combinator_interpolates_authored_patches() {
+        fn flat(offset_x: f32) -> [f32; 32] {
+            let mut out = [0.0f32; 32];
+            for row in 0..4 {
+                for col in 0..4 {
+                    let index = row * 4 + col;
+                    out[index * 2] = col as f32 / 3.0 + offset_x;
+                    out[index * 2 + 1] = row as f32 / 3.0;
+                }
+            }
+            out
+        }
+        let entry = crate::schema::MeshCombinatorEntry {
+            key: Some("p".into()),
+            range_begin: 0.0,
+            range_end: 1.0,
+            mesh_count: 2,
+            neutral_index: -1,
+            values: vec![flat(0.0), flat(0.1)],
+        };
+        let mut variables = BTreeMap::new();
+        variables.insert("p".to_string(), 0.5);
+        let patch = evaluate_one_mesh_combinator(&entry, false, &variables, 20, None).unwrap();
+        let sample = patch.sample(0.5, 0.5);
+        assert!((sample[0] - 0.55).abs() < 1e-5);
+        assert!((sample[1] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn mesh_sync_warps_child_coordinate() {
+        let mut patch = MeshPatch::identity();
+        for point in &mut patch.control_points {
+            point[0] += 0.1;
+        }
+        patch.domain = Some([-50.0, -40.0, 100.0, 80.0]);
+        let mut state = FrameState {
+            coord: [10.0, 20.0, 0.0],
+            ..FrameState::default()
+        };
+        apply_mesh_sync_child_state(
+            &mut state,
+            MeshSyncState {
+                patch,
+                mask: 0x1,
+                coordinate: 0,
+            },
+            0x7FC,
+        );
+        assert!((state.coord[0] - 20.0).abs() < 1e-4);
+        assert!((state.coord[1] - 20.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn partial_inheritance_removes_motion_root_channels() {
+        let state = LinearState {
+            flip_x: true,
+            flip_y: true,
+            rotation_deg: 30.0,
+            scale: [2.0, 3.0],
+            shear: [5.0, 6.0],
+        };
+        let root = LinearState {
+            flip_x: true,
+            flip_y: true,
+            rotation_deg: 10.0,
+            scale: [2.0, 3.0],
+            shear: [1.0, 2.0],
+        };
+        let relative = remove_motion_root_linear_state(state, root, 0x1FC);
+        assert!(!relative.flip_x);
+        assert!(!relative.flip_y);
+        assert!((relative.rotation_deg - 20.0).abs() < 1e-9);
+        assert!((relative.scale[0] - 1.0).abs() < 1e-9);
+        assert!((relative.scale[1] - 1.0).abs() < 1e-9);
+        assert!((relative.shear[0] - 4.0).abs() < 1e-9);
+        assert!((relative.shear[1] - 4.0).abs() < 1e-9);
     }
 
     #[test]

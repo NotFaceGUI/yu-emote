@@ -18,13 +18,16 @@ This product includes software developed by third parties:
 Reference-only facts (no code copied):
 
 0a. PSB body stream cipher (6-word state) and single-DWORD key search are
-    documented by FreeMote (CC BY-NC-SA 4.0) and eluna (no license). The
-    implementation in src/psb.rs is independent.
+    documented by FreeMote (CC BY-NC-SA 4.0) and eluna (MPL-2.0 crate
+    metadata). The implementation in src/psb.rs is independent.
 
 Reference-only projects (no code copied):
 
-3. eluna (https://github.com/xmoezzz/eluna) — no license declared; used only
-   as a behavioral reference for schema/runtime extraction.
+3. eluna (https://github.com/xmoezzz/eluna) — the `eluna_rs` crate declares
+   MPL-2.0; the preview player declares MIT OR Apache-2.0. It is used only as
+   a behavioral reference for schema/runtime extraction (native function
+   semantics for inheritance, mesh chains, masks and blend modes). No source
+   code is copied; the Rust implementation here is independent.
 
 4. FreeMote and the FreeMote WebGL runtime
    (https://github.com/UlyssesWu/FreeMote) — CC BY-NC-SA 4.0; used only as an

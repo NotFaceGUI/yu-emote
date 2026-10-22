@@ -537,6 +537,8 @@ pub struct Layer {
     pub obj_tri_priority: Option<i64>,
     /// `transformOrder`: permutation of flip/rotation/scale/shear stages.
     pub transform_order: Vec<i64>,
+    /// Parameterized mesh patches (`meshCombinator.combinatorList`).
+    pub mesh_combinator: Option<MeshCombinator>,
     /// Keyframes.
     pub frames: Vec<Frame>,
     /// Child layers.
@@ -646,6 +648,36 @@ impl Mesh {
     pub fn cc_points(&self) -> Vec<[f64; 2]> {
         points(self.cc.as_deref())
     }
+}
+
+/// Parameterized mesh combinators attached to one layer.
+///
+/// Each entry selects `rawMeshList` resource data by a runtime variable,
+/// interpolates between `meshCount` authored patches and uses
+/// `neutralIndex` as the identity patch. A layer combines the first entry
+/// into its own sprite and the remaining entries into its shape-synced
+/// children; see `pose::evaluate_mesh_combinator`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MeshCombinator {
+    /// Authored combinators in list order.
+    pub entries: Vec<MeshCombinatorEntry>,
+}
+
+/// One `meshCombinator.combinatorList` entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MeshCombinatorEntry {
+    /// Variable key (`variable.key`).
+    pub key: Option<String>,
+    /// `variable.rangeBegin`.
+    pub range_begin: f64,
+    /// `variable.rangeEnd`.
+    pub range_end: f64,
+    /// `variable.meshCount`.
+    pub mesh_count: usize,
+    /// `variable.neutralIndex` (identity mesh index; -1 when absent).
+    pub neutral_index: i64,
+    /// Decoded 32-float meshes from the `rawMeshList` resource.
+    pub values: Vec<[f32; 32]>,
 }
 
 fn points(flat: Option<&[f64]>) -> Vec<[f64; 2]> {
@@ -783,7 +815,7 @@ impl Model {
                 };
                 if let Some(motions) = get(object_map, "motion") {
                     for (motion_name, motion_value) in obj_or_empty(Some(motions)) {
-                        let motion_def = motion(motion_value);
+                        let motion_def = motion(motion_value, &document.resource_data);
                         model.stats.motions += 1;
                         model.stats.layers += count_layers(&motion_def.layers);
                         object_def
@@ -974,7 +1006,7 @@ fn list_or_empty(value: Option<&PsbValue>) -> &[PsbValue] {
     value.and_then(as_list).unwrap_or(&EMPTY)
 }
 
-fn motion(value: &PsbValue) -> Motion {
+fn motion(value: &PsbValue, resources: &[Vec<u8>]) -> Motion {
     let map = obj_or_empty(Some(value));
     let bounds = obj_or_empty(get(map, "bounds"));
     let mut layer_index_map = BTreeMap::new();
@@ -1010,15 +1042,18 @@ fn motion(value: &PsbValue) -> Motion {
             .map(parameter_def)
             .collect(),
         parameterize: get_i64(map, "parameterize"),
-        layers: layers(get(map, "layer")),
+        layers: layers(get(map, "layer"), resources),
     }
 }
 
-fn layers(value: Option<&PsbValue>) -> Vec<Layer> {
-    list_or_empty(value).iter().map(layer).collect()
+fn layers(value: Option<&PsbValue>, resources: &[Vec<u8>]) -> Vec<Layer> {
+    list_or_empty(value)
+        .iter()
+        .map(|layer_value| layer(layer_value, resources))
+        .collect()
 }
 
-fn layer(value: &PsbValue) -> Layer {
+fn layer(value: &PsbValue, resources: &[Vec<u8>]) -> Layer {
     let map = obj_or_empty(Some(value));
     let mut frames = Vec::new();
     for frame in list_or_empty(get(map, "frameList")) {
@@ -1058,9 +1093,68 @@ fn layer(value: &PsbValue) -> Layer {
             .and_then(as_list)
             .map(|items| items.iter().filter_map(as_i64).collect())
             .unwrap_or_default(),
+        mesh_combinator: mesh_combinator(map, resources),
         frames,
-        children: layers(get(map, "children")),
+        children: layers(get(map, "children"), resources),
     }
+}
+
+fn mesh_combinator(map: &PsbMap, resources: &[Vec<u8>]) -> Option<MeshCombinator> {
+    let root = get(map, "meshCombinator")?;
+    let root = obj_or_empty(Some(root));
+    let mut entries = Vec::new();
+    for value in list_or_empty(get(root, "combinatorList")) {
+        let entry = obj_or_empty(Some(value));
+        let variable = obj_or_empty(get(entry, "variable"));
+        let mesh_count = get_i64(variable, "meshCount").unwrap_or(1).max(1) as usize;
+        let Some(resource_index) = get_i64(entry, "rawMeshList").filter(|index| *index >= 0) else {
+            continue;
+        };
+        let Some(raw) = resources.get(resource_index as usize) else {
+            continue;
+        };
+        let Some(values) = decode_raw_mesh_list(raw, mesh_count) else {
+            continue;
+        };
+        entries.push(MeshCombinatorEntry {
+            key: get_str(variable, "key"),
+            range_begin: get_f64(variable, "rangeBegin").unwrap_or(0.0),
+            range_end: get_f64(variable, "rangeEnd").unwrap_or(1.0),
+            mesh_count,
+            neutral_index: get_i64(variable, "neutralIndex").unwrap_or(-1),
+            values,
+        });
+    }
+    (!entries.is_empty()).then_some(MeshCombinator { entries })
+}
+
+/// Decode `meshCount * 32` floats (f64 or f32 little-endian) from a
+/// `rawMeshList` resource. The values are raw control points; a combinator
+/// may later add the identity basis when its data is authored as a delta.
+fn decode_raw_mesh_list(raw: &[u8], mesh_count: usize) -> Option<Vec<[f32; 32]>> {
+    let total = mesh_count.checked_mul(32)?;
+    let mut values = vec![0.0f32; total];
+    if raw.len() >= total * 8 {
+        for (slot, chunk) in raw.chunks_exact(8).take(total).enumerate() {
+            values[slot] = f64::from_le_bytes(chunk.try_into().ok()?) as f32;
+        }
+    } else if raw.len() >= total * 4 {
+        for (slot, chunk) in raw.chunks_exact(4).take(total).enumerate() {
+            values[slot] = f32::from_le_bytes(chunk.try_into().ok()?);
+        }
+    } else {
+        return None;
+    }
+    Some(
+        values
+            .chunks_exact(32)
+            .map(|chunk| {
+                let mut mesh = [0.0f32; 32];
+                mesh.copy_from_slice(chunk);
+                mesh
+            })
+            .collect(),
+    )
 }
 
 fn content(value: &PsbValue) -> Content {

@@ -93,7 +93,7 @@ pub struct SoftStats {
     /// Items skipped because their page had no decodable texture.
     pub missing_textures: usize,
     /// Items using a non-default blend mode (rendered with normal alpha).
-    pub unsupported_blend: usize,
+    pub non_default_blend: usize,
     /// Items carrying mask/stencil state.
     pub masked_items: usize,
     /// Source draw items rasterized into composite-mask buffers.
@@ -170,6 +170,7 @@ fn rasterize_triangle(
     v2: &PlanVertex,
     view: ViewTransform,
     mask: Option<&[f32]>,
+    blend_mode: u32,
 ) -> usize {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
@@ -219,13 +220,34 @@ fn rasterize_triangle(
                 }
                 alpha *= coverage;
             }
-            let src = [
+            let mut src = [
                 texel[0] * color[0],
                 texel[1] * color[1],
                 texel[2] * color[2],
                 texel[3] * alpha,
             ];
-            blend_source_over(&mut target[index..index + 4], src);
+            // MMotionDevice::SetBlendMode (`sub_1041A190`): the high nibble
+            // 0x10 selects D3DTOP_MODULATE2X on texture stage 0.
+            if (blend_mode & 0xF0) == 0x10 {
+                src[0] = (src[0] * 2.0).min(1.0);
+                src[1] = (src[1] * 2.0).min(1.0);
+                src[2] = (src[2] * 2.0).min(1.0);
+            }
+            let low = blend_mode & 0xFF0F;
+            if low == 3 || low == 4 {
+                src[0] *= src[3];
+                src[1] *= src[3];
+                src[2] *= src[3];
+            } else if low == 5 {
+                src[0] = 1.0 - src[0];
+                src[1] = 1.0 - src[1];
+                src[2] = 1.0 - src[2];
+            }
+            if low == 0 {
+                blend_source_over(&mut target[index..index + 4], src);
+            } else {
+                blend_pixel(&mut target[index..index + 4], src, low);
+            }
             covered += 1;
         }
     }
@@ -265,6 +287,58 @@ fn sample_bilinear(texture: &DecodedTexture, uv: [f32; 2]) -> [f32; 4] {
         out[channel] = (top + (bottom - top) * fy).clamp(0.0, 1.0);
     }
     out
+}
+
+fn blend_pixel(dst: &mut [u8], src: [f32; 4], mode: u32) {
+    // Native blend table (`sub_1041A190`); low nibble modes 1..5 select
+    // additive / reverse-subtract / modulate combinations.
+    let dst_color = [
+        dst[0] as f32 / 255.0,
+        dst[1] as f32 / 255.0,
+        dst[2] as f32 / 255.0,
+        dst[3] as f32 / 255.0,
+    ];
+    let alpha = src[3].clamp(0.0, 1.0);
+    let (r, g, b, a) = match mode {
+        1 => (
+            src[0] * alpha + dst_color[0],
+            src[1] * alpha + dst_color[1],
+            src[2] * alpha + dst_color[2],
+            dst_color[3],
+        ),
+        2 | 5 => (
+            dst_color[0] - src[0] * alpha,
+            dst_color[1] - src[1] * alpha,
+            dst_color[2] - src[2] * alpha,
+            dst_color[3],
+        ),
+        3 => (
+            src[0] * dst_color[0] + dst_color[0] * (1.0 - alpha),
+            src[1] * dst_color[1] + dst_color[1] * (1.0 - alpha),
+            src[2] * dst_color[2] + dst_color[2] * (1.0 - alpha),
+            dst_color[3],
+        ),
+        4 => (
+            src[0] * (1.0 - dst_color[0]) + dst_color[0],
+            src[1] * (1.0 - dst_color[1]) + dst_color[1],
+            src[2] * (1.0 - dst_color[2]) + dst_color[2],
+            dst_color[3],
+        ),
+        _ => {
+            let inverse = 1.0 - alpha;
+            (
+                src[0] * alpha + dst_color[0] * inverse,
+                src[1] * alpha + dst_color[1] * inverse,
+                src[2] * alpha + dst_color[2] * inverse,
+                alpha + dst_color[3] * inverse,
+            )
+        }
+    };
+    let quantize = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    dst[0] = quantize(r);
+    dst[1] = quantize(g);
+    dst[2] = quantize(b);
+    dst[3] = quantize(a);
 }
 
 fn blend_source_over(dst: &mut [u8], src: [f32; 4]) {
@@ -403,8 +477,8 @@ fn render_with_textures(
 
     for item in &plan.items {
         stats.items += 1;
-        if (item.blend_mode & 0xF0) != 0x10 {
-            stats.unsupported_blend += 1;
+        if (1..=5).contains(&(item.blend_mode & 0xFF0F)) {
+            stats.non_default_blend += 1;
         }
         if item.mask != 0 || item.stencil_type != 0 || item.mask_group.is_some() {
             stats.masked_items += 1;
@@ -426,8 +500,18 @@ fn render_with_textures(
                 continue;
             };
             stats.triangles += 1;
-            stats.covered +=
-                rasterize_triangle(&mut rgba8, width, height, texture, v0, v1, v2, view, mask);
+            stats.covered += rasterize_triangle(
+                &mut rgba8,
+                width,
+                height,
+                texture,
+                v0,
+                v1,
+                v2,
+                view,
+                mask,
+                item.blend_mode,
+            );
         }
     }
     Ok((
@@ -497,6 +581,16 @@ fn rasterize_triangle_coverage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_blend_modes_are_applied() {
+        let mut pixel = [0u8, 0, 0, 255];
+        blend_pixel(&mut pixel, [0.5, 0.0, 0.0, 1.0], 1);
+        assert_eq!(pixel, [128, 0, 0, 255]);
+        let mut pixel = [0u8, 0, 0, 255];
+        blend_pixel(&mut pixel, [0.5, 0.0, 0.0, 1.0], 2);
+        assert_eq!(pixel, [0, 0, 0, 255]);
+    }
 
     #[test]
     fn source_over_is_stable() {

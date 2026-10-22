@@ -18,8 +18,8 @@ native + `wasm32` use.
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
 | Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
-| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order, sprite-mesh (shape-sync) inheritance (`psb-pose`) | ✅ M2 core (parameterized mesh combinators, coord/angle/zoom sync pending) |
-| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG) | ✅ M3 baseline |
+| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order, native inheritance source (`0x400000`/motion root), sprite-mesh shape sync + `meshSyncChildMask` 0x1/0x2/0x4 + `meshCombinator` (`psb-pose`) | ✅ M2 core |
+| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG), native blend modes 0..5 + MODULATE2X | ✅ M3 baseline |
 | Composite alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`, type-3 source expansion) in the CPU path | ✅ M3 core |
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
@@ -137,7 +137,17 @@ are recorded here so the implementation can be audited against them:
   patch to children only when `meshTransform == 1` and
   `meshSyncChildMask & 8` (shape sync); patches combine by pointwise
   displacement from identity (`dst = next + (self - identity)`). This drives
-  the eyelid/iris, head, body, mouth and eyebrow deformers.
+  the eyelid/iris, head, body, mouth and eyebrow deformers. The other sync
+  bits warp child coordinates/angle scale through the patch domain, and
+  `meshCombinator.combinatorList` interpolates `rawMeshList` resources by
+  variable.
+- **Native inheritance source.** A layer with `inheritMask & 0x400000` is
+  transparent for inheritance; descendants use the first ancestor above it.
+  Partial inheritance removes the motion-root channels, builds the relative
+  matrix and reapplies the root matrix outside it (`sub_10331060`).
+- **Blend modes.** The CPU path implements the native `sub_1041A190` table
+  (modes 0..5) and D3DTOP_MODULATE2X; the neutral vertex color for MODULATE2X
+  frames is `0x808080FF`, which doubles to white.
 - **YSEmote ABI.** The exported wrappers are **stdcall** (`RET imm`); declaring
   them `__cdecl` corrupts the stack after a few updates. Ordinal 254 calls
   player vtable `+0xd4` (`Update(seconds)`), ordinal 255 calls `+0xd8`, which
