@@ -1007,4 +1007,76 @@ mod tests {
         assert!((lerp_angle(350.0, 10.0, 0.5) - 0.0).abs() < 1e-9);
         assert!((lerp_angle(10.0, 350.0, 0.5) - 0.0).abs() < 1e-9);
     }
+
+    #[test]
+    fn type_zero_frame_holds_preceding_content() {
+        let frames = [
+            Frame {
+                time: 0,
+                kind: 2,
+                time_quantization: None,
+                content: Some(Content {
+                    coord: Some([7.0, -3.0, 0.0]),
+                    ..Content::default()
+                }),
+            },
+            Frame {
+                time: 10,
+                kind: 0,
+                time_quantization: None,
+                content: None,
+            },
+        ];
+        let state = evaluate_frames(&frames, 10.0, None);
+        assert!(state.valid);
+        assert_eq!(state.coord, [7.0, -3.0, 0.0]);
+        assert_eq!(state.kind, 0);
+    }
+
+    fn drawable_layer(label: &str, z: f64, priority_path: &[i64]) -> LayerPose {
+        LayerPose {
+            label: label.to_string(),
+            path: label.to_string(),
+            kind: 0,
+            sample_time: 0.0,
+            state: FrameState::default(),
+            local: Affine2::identity(),
+            world: Affine2::identity(),
+            world_origin: [0.0, 0.0, z],
+            opacity: 1.0,
+            visible: true,
+            drawable: true,
+            mesh_division: 1,
+            mesh_transform: 0,
+            mesh_combine: false,
+            stencil_type: 0,
+            mask_group: None,
+            scope: 0,
+            priority_path: priority_path.to_vec(),
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn drawables_sort_by_resolved_z() {
+        let pose = Pose {
+            object: "test".into(),
+            motion: "m".into(),
+            time: 0.0,
+            variables: BTreeMap::new(),
+            mask_groups: Vec::new(),
+            layers: vec![
+                drawable_layer("face", 3.0, &[0, 9]),
+                drawable_layer("rear_hair", -10.0, &[0, 20]),
+                drawable_layer("front_hair", 4.0, &[0, 1]),
+                drawable_layer("eye", 5.0, &[0, 0]),
+            ],
+        };
+        let labels: Vec<&str> = pose
+            .drawables()
+            .iter()
+            .map(|layer| layer.label.as_str())
+            .collect();
+        assert_eq!(labels, ["rear_hair", "face", "front_hair", "eye"]);
+    }
 }
