@@ -84,10 +84,11 @@ library; tests read it from `YURIS_EMOTE_KEY`.
 
 ## Milestones
 
-- **M1 (done in this tree)** typed PSB schema (`schema`), `RGBA4444` atlas
-  decoding (`texture`), deterministic `psb-dump`, sample-backed tests. The
-  source layout and filter rules from `amadeus-emote-loader` (Apache-2.0) are
-  documented behavior references; no code was copied.
+- **M1 (data extraction done)** typed PSB schema (`schema`), `RGBA4444` atlas
+  decoding (`texture`), deterministic `psb-dump`, sample-backed tests. Part
+  visibility / normalization rules still need evidence. The source layout and
+  filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
+  behavior references; no code was copied.
 - **M2 (core done)** `Animator`: named variables, optional fades, timeline
   playback/stop, looping, linear keyframe sampling, deterministic `tick`. The
   official frame rate and non-zero easing curves still need oracle evidence;
