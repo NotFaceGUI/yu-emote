@@ -215,7 +215,11 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
             .vertices
             .iter()
             .map(|vertex| PlanVertex {
-                position: transform_point(world, [vertex.x - origin_x, vertex.y - origin_y]),
+                position: transform_point(
+                    world,
+                    &layer.deformers,
+                    [vertex.x - origin_x, vertex.y - origin_y],
+                ),
                 color: mesh_color(layer, vertex.u, vertex.v),
                 uv: [
                     (icon.left as f32 + vertex.u * width) / page_width as f32,
@@ -254,7 +258,7 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
             .zip(uvs.iter())
             .enumerate()
             .map(|(index, (position, uv))| PlanVertex {
-                position: transform_point(world, *position),
+                position: transform_point(world, &layer.deformers, *position),
                 color: corner_color(layer, index),
                 uv: *uv,
             })
@@ -328,9 +332,57 @@ fn mesh_color(layer: &LayerPose, u: f32, v: f32) -> [f32; 4] {
     out
 }
 
-fn transform_point(world: Affine2, point: [f32; 2]) -> [f32; 2] {
-    let out = world.apply([point[0] as f64, point[1] as f64]);
+fn transform_point(
+    world: Affine2,
+    deformers: &[crate::pose::Deformer],
+    point: [f32; 2],
+) -> [f32; 2] {
+    let mut out = world.apply([point[0] as f64, point[1] as f64]);
+    // Leaf-to-root: inner deformers (eye position) act before the head/body
+    // deformers that contain them.
+    for deformer in deformers.iter().rev() {
+        if deformer.width <= 0.0 || deformer.height <= 0.0 {
+            continue;
+        }
+        let local = deformer.inverse.apply(out);
+        // Clamp to a margin around the deformer box. Cubic extrapolation
+        // explodes for points far outside the box (e.g. a small eye-position
+        // deformer over the whole head) and would create screen-sized
+        // triangles.
+        let u = (local[0] / deformer.width).clamp(-0.25, 1.25);
+        let v = (local[1] / deformer.height).clamp(-0.25, 1.25);
+        let warped = sample_deformer(&deformer.patch, u, v);
+        out = deformer
+            .world
+            .apply([warped[0] * deformer.width, warped[1] * deformer.height]);
+    }
     [out[0] as f32, out[1] as f32]
+}
+
+fn sample_deformer(patch: &[f64], u: f64, v: f64) -> [f64; 2] {
+    if patch.len() < 32 {
+        return [u, v];
+    }
+    let basis = |t: f64| {
+        let s = 1.0 - t;
+        [s * s * s, 3.0 * t * s * s, 3.0 * t * t * s, t * t * t]
+    };
+    let bu = basis(u);
+    let bv = basis(v);
+    let mut out = [0.0f64; 2];
+    for (row, bv_row) in bv.iter().enumerate() {
+        for (col, bu_col) in bu.iter().enumerate() {
+            let weight = bv_row * bu_col;
+            let point = [patch[(row * 4 + col) * 2], patch[(row * 4 + col) * 2 + 1]];
+            out[0] += point[0] * weight;
+            out[1] += point[1] * weight;
+        }
+    }
+    if out[0].is_finite() && out[1].is_finite() {
+        out
+    } else {
+        [u, v]
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +412,7 @@ mod tests {
             stencil_type: 0,
             mask_group: None,
             scope: 0,
+            deformers: Vec::new(),
             priority_path: Vec::new(),
             children: Vec::new(),
         };

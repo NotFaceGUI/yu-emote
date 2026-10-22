@@ -13,6 +13,7 @@ use std::fs::File;
 use std::process::ExitCode;
 
 use serde_json::json;
+use yu_emote::anim::Animator;
 use yu_emote::pose::Pose;
 use yu_emote::psb;
 use yu_emote::schema::Model;
@@ -37,8 +38,14 @@ fn main() -> ExitCode {
     let mut fit = true;
     let mut margin = 20.0f32;
     let mut scale_override: Option<f32> = None;
-    let mut only: Option<String> = None;
-    let mut skip: Option<String> = None;
+    let mut only: Vec<String> = Vec::new();
+    let mut skip: Vec<String> = Vec::new();
+    let mut limit: Option<usize> = None;
+    let mut timeline: Option<String> = None;
+    let mut seconds = 0.0f64;
+    let mut fps = 60.0f64;
+    let mut loop_timeline = false;
+    let mut fixed_view: Option<(f32, f32, f32)> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--key" => match args.next().as_deref().map(parse_key) {
@@ -96,8 +103,61 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
-            "--only" => only = args.next(),
-            "--skip" => skip = args.next(),
+            "--only" => {
+                if let Some(value) = args.next() {
+                    only.extend(value.split(',').map(str::to_owned));
+                }
+            }
+            "--skip" => {
+                if let Some(value) = args.next() {
+                    skip.extend(value.split(',').map(str::to_owned));
+                }
+            }
+            "--limit" => match args.next().map(|value| value.parse::<usize>()) {
+                Some(Ok(value)) => limit = Some(value),
+                _ => {
+                    eprintln!("--limit needs a number");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--timeline" => timeline = args.next(),
+            "--loop" => loop_timeline = true,
+            "--seconds" => match args.next().map(|value| value.parse::<f64>()) {
+                Some(Ok(value)) => seconds = value,
+                _ => {
+                    eprintln!("--seconds needs a number");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--fps" => match args.next().map(|value| value.parse::<f64>()) {
+                Some(Ok(value)) if value > 0.0 => fps = value,
+                _ => {
+                    eprintln!("--fps needs a positive number");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--view" => {
+                let Some(value) = args.next() else {
+                    eprintln!("--view needs SCALE,X,Y");
+                    return ExitCode::FAILURE;
+                };
+                let parts: Vec<_> = value.split(',').collect();
+                if parts.len() != 3 {
+                    eprintln!("--view needs SCALE,X,Y");
+                    return ExitCode::FAILURE;
+                }
+                match (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                ) {
+                    (Ok(scale), Ok(x), Ok(y)) => fixed_view = Some((scale, x, y)),
+                    _ => {
+                        eprintln!("--view needs numeric SCALE,X,Y");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             other => {
                 eprintln!("unknown argument `{other}`");
                 return ExitCode::FAILURE;
@@ -113,6 +173,32 @@ fn main() -> ExitCode {
         }
     };
     let model = Model::from_document(&document);
+    let mut timeline_info = None;
+    if let Some(name) = &timeline {
+        let mut animator = Animator::new(&model, fps);
+        if let Err(error) = animator.play_with(name, 1.0, loop_timeline) {
+            eprintln!("timeline `{name}`: {error}");
+            return ExitCode::FAILURE;
+        }
+        let mut ticks = 0usize;
+        let count = (seconds.max(0.0) * fps).round() as usize;
+        for _ in 0..count {
+            animator.tick(1.0 / fps);
+            ticks += 1;
+        }
+        let evaluated = animator.evaluated_variables();
+        // Explicit --var values win over the timeline.
+        for (name, value) in evaluated {
+            variables.entry(name).or_insert(value);
+        }
+        timeline_info = Some(json!({
+            "name": name,
+            "seconds": seconds,
+            "fps": fps,
+            "ticks": ticks,
+            "unsupported_easing": animator.unsupported_easing(),
+        }));
+    }
     let object = object
         .or_else(|| model.metadata.character.clone())
         .or_else(|| model.objects.keys().next().cloned())
@@ -131,7 +217,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let mut plan = yu_emote::plan::RenderPlan::build(&model, &pose);
-    let view = if let Some(scale) = scale_override {
+    let view = if let Some((scale, x, y)) = fixed_view {
+        soft::ViewTransform {
+            scale,
+            offset: [x, y],
+        }
+    } else if let Some(scale) = scale_override {
         let (min, max) = plan.bounds().unwrap_or(([0.0; 2], [1.0; 2]));
         let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
         soft::ViewTransform {
@@ -146,13 +237,21 @@ fn main() -> ExitCode {
     } else {
         soft::ViewTransform::identity()
     };
-    if let Some(needle) = &only {
-        plan.items
-            .retain(|item| item.label.contains(needle.as_str()));
+    if !only.is_empty() {
+        plan.items.retain(|item| {
+            only.iter()
+                .any(|needle| item.label.contains(needle.as_str()))
+        });
     }
-    if let Some(needle) = &skip {
-        plan.items
-            .retain(|item| !item.label.contains(needle.as_str()));
+    if !skip.is_empty() {
+        plan.items.retain(|item| {
+            !skip
+                .iter()
+                .any(|needle| item.label.contains(needle.as_str()))
+        });
+    }
+    if let Some(limit) = limit {
+        plan.items.truncate(limit);
     }
     let (image, stats) = match soft::render_plan_with_document(&document, &model, &plan, view) {
         Ok(rendered) => rendered,
@@ -174,6 +273,7 @@ fn main() -> ExitCode {
             "bbox": bbox,
             "view": view,
             "stats": stats,
+            "timeline": timeline_info,
         }))
         .unwrap_or_default()
     );

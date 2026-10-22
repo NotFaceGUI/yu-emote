@@ -393,6 +393,27 @@ impl Affine2 {
         [linear[0] + self.tx, linear[1] + self.ty]
     }
 
+    /// Inverse transform, or `None` for a singular matrix.
+    pub fn inverse(self) -> Option<Self> {
+        let determinant = self.m11 * self.m22 - self.m12 * self.m21;
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            return None;
+        }
+        let inv = 1.0 / determinant;
+        let m11 = self.m22 * inv;
+        let m12 = -self.m12 * inv;
+        let m21 = -self.m21 * inv;
+        let m22 = self.m11 * inv;
+        Some(Self {
+            m11,
+            m12,
+            m21,
+            m22,
+            tx: -(self.tx * m11 + self.ty * m21),
+            ty: -(self.tx * m12 + self.ty * m22),
+        })
+    }
+
     /// Column-major 4x4 matrix for the vertex shader (`cMat`).
     pub fn to_mat4(self) -> [[f32; 4]; 4] {
         [
@@ -575,10 +596,28 @@ pub struct LayerPose {
     /// Motion scope this layer was evaluated in (nested motions get their own
     /// scope, so equal labels in the left/right eye never alias).
     pub scope: usize,
+    /// Ancestor deformer meshes that warp this layer's geometry, outermost
+    /// first. Each entry is applied leaf-to-root by the plan builder.
+    pub deformers: Vec<Deformer>,
     /// Draw-order key: rank path from `priority` frames.
     pub priority_path: Vec<i64>,
     /// Child layers.
     pub children: Vec<LayerPose>,
+}
+
+/// One ancestor 4x4 Bezier deformer (`mesh.bp` on a blank proxy layer).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Deformer {
+    /// Deformer local space -> world.
+    pub world: Affine2,
+    /// World -> deformer local space.
+    pub inverse: Affine2,
+    /// Deformer box width in local pixels (`icon` rect width).
+    pub width: f64,
+    /// Deformer box height in local pixels.
+    pub height: f64,
+    /// Flat row-major 4x4 control points (32 floats).
+    pub patch: Vec<f64>,
 }
 
 /// One composite alpha-mask owner (`stencilType & 4`).
@@ -646,6 +685,7 @@ impl Pose {
             opacity: 1.0,
             visible: true,
             mask_group: None,
+            deformers: Vec::new(),
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
@@ -716,6 +756,7 @@ struct Context {
     opacity: f64,
     visible: bool,
     mask_group: Option<usize>,
+    deformers: Vec<Deformer>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,6 +848,13 @@ fn evaluate_layer(
         child_mask_group = Some(id);
     }
 
+    // TODO(M2): parameterized deformer-mesh inheritance. The native chain
+    // applies `mesh.bp` in an absolute-mesh convention that is not yet
+    // evidenced; treating every blank proxy as a world-space warp tears the
+    // character apart. Keep the pose field but do not warp until the
+    // convention is proven.
+    let child_deformers = parent.deformers.clone();
+
     let context = Context {
         world,
         world_origin,
@@ -815,6 +863,7 @@ fn evaluate_layer(
         opacity,
         visible: visible_chain,
         mask_group: child_mask_group,
+        deformers: child_deformers,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -914,6 +963,7 @@ fn evaluate_layer(
         stencil_type: layer.stencil_type.unwrap_or(0),
         mask_group: inherited_mask_group,
         scope,
+        deformers: parent.deformers.clone(),
         priority_path,
         children,
     }
@@ -1052,6 +1102,7 @@ mod tests {
             stencil_type: 0,
             mask_group: None,
             scope: 0,
+            deformers: Vec::new(),
             priority_path: priority_path.to_vec(),
             children: Vec::new(),
         }

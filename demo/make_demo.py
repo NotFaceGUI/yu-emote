@@ -29,19 +29,17 @@ OUT = ROOT / "target" / "emote-demo"
 
 POSES = [
     ("neutral", "通常", [], "#8aa4c8"),
-    ("smile", "笑顔", ["face_mouth=30", "face_eyebrow=40", "face_eye_open=20"], "#e8b45a"),
+    ("smile", "笑顔", ["face_mouth=30", "face_eyebrow=40", "face_eye_open=25"], "#e8b45a"),
     ("angry", "怒り", ["face_mouth=10", "face_eyebrow=20", "face_eye_open=-5"], "#d46a5a"),
     ("tilt", "首かしげ", ["head_slant=30"], "#b58ad4"),
 ]
 
 
-def run_render(psb: Path, key: str | None, variables: list[str], out: Path) -> dict:
+def run_render(psb: Path, key: str | None, extra: list[str], out: Path) -> dict:
     out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [str(RENDER), str(psb), "--time", "0", "--out", str(out)]
+    cmd = [str(RENDER), str(psb), *extra, "--out", str(out)]
     if key:
         cmd += ["--key", key]
-    for spec in variables:
-        cmd += ["--var", spec]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise SystemExit(f"render failed for {out.name}:\n{proc.stderr or proc.stdout}")
@@ -95,25 +93,72 @@ def main() -> int:
     models = []
     for spec in args.model:
         label, path = parse_model(spec)
+        stem = path.stem
+
+        # One camera per model: derive it from the neutral pose, then render
+        # every expression and animation frame with the same scale/offset so
+        # tilting or moving never changes the apparent size.
+        neutral_raw = OUT / "frames" / f"{stem}-neutral-fit.png"
+        base_stats = run_render(path, args.key, ["--time", "0"], neutral_raw)
+        view = base_stats.get("view") or {}
+        if view:
+            fixed = ["--view", f"{view['scale']},{view['offset'][0]},{view['offset'][1]}"]
+        else:
+            fixed = []
+
         rendered = []
         for pose_id, pose_label, variables, accent in POSES:
-            raw_path = OUT / "frames" / f"{path.stem}-{pose_id}.png"
-            stats = run_render(path, args.key, variables, raw_path)
-            rendered.append((pose_id, pose_label, accent, Image.open(raw_path).convert("RGBA"), stats))
-        box = trim_union([frame[3] for frame in rendered])
+            raw_path = OUT / "frames" / f"{stem}-{pose_id}.png"
+            extra = ["--time", "0", *fixed]
+            for spec_value in variables:
+                extra += ["--var", spec_value]
+            stats = run_render(path, args.key, extra, raw_path)
+            rendered.append(
+                (pose_id, pose_label, accent, Image.open(raw_path).convert("RGBA"), stats)
+            )
+
+        # Idle timeline frames (Nekopara 待機ループ00; skipped for models that
+        # do not provide it, e.g. the ERIS test model).
+        anim = []
+        try:
+            for index in range(6):
+                raw_path = OUT / "frames" / f"{stem}-idle-{index}.png"
+                extra = [
+                    "--timeline",
+                    "待機ループ00",
+                    "--loop",
+                    "--seconds",
+                    f"{index * 0.15:.2f}",
+                    *fixed,
+                ]
+                run_render(path, args.key, extra, raw_path)
+                anim.append(Image.open(raw_path).convert("RGBA"))
+        except SystemExit:
+            anim = []
+
+        box = trim_union([frame[3] for frame in rendered] + anim)
         height = min(args.max_height, box[3] - box[1])
         width = max(1, round((box[2] - box[0]) * height / (box[3] - box[1])))
-        prepared = []
-        for pose_id, pose_label, accent, image, stats in rendered:
-            cropped = image.crop(box).resize((width, height), Image.LANCZOS)
-            prepared.append((pose_id, pose_label, accent, encode_webp(cropped), stats))
+
+        def encode(image: Image.Image) -> str:
+            return encode_webp(image.crop(box).resize((width, height), Image.LANCZOS))
+
         models.append(
             {
                 "label": label,
-                "stem": path.stem,
-                "poses": {pid: f"data:image/webp;base64,{data}" for pid, _, _, data, _ in prepared},
-                "poseMeta": [{"id": pid, "label": plabel, "accent": accent} for pid, plabel, accent, _, _ in prepared],
-                "stats": next((stats for pid, _, _, _, stats in prepared if pid == "neutral"), {}),
+                "stem": stem,
+                "poses": {
+                    pid: f"data:image/webp;base64,{encode(image)}"
+                    for pid, _, _, image, _ in rendered
+                },
+                "anim": [f"data:image/webp;base64,{encode(image)}" for image in anim],
+                "poseMeta": [
+                    {"id": pid, "label": plabel, "accent": accent}
+                    for pid, plabel, accent, _, _ in rendered
+                ],
+                "stats": next(
+                    (stats for pid, _, _, _, stats in rendered if pid == "neutral"), {}
+                ),
             }
         )
 
@@ -237,17 +282,20 @@ const posesEl = document.getElementById('poses');
 const view = document.getElementById('view');
 const nameEl = document.getElementById('pose-name');
 const varsEl = document.getElementById('pose-vars');
-let mi = 0, pi = 0, currentPoseMeta = MODELS[0].poseMeta;
+let mi = 0, pi = 0, playing = false, frame = 0, timer = null;
 
 MODELS.forEach((model, i) => {{
   const button = document.createElement('button');
   button.textContent = model.label;
   button.style.setProperty('--pill', '#8aa4c8');
-  button.addEventListener('click', () => select(i, pi));
+  button.addEventListener('click', () => {{
+    mi = i;
+    if (playing) startLive(); else select(mi, pi);
+  }});
   modelsEl.appendChild(button);
 }});
 
-currentPoseMeta.forEach((pose, i) => {{
+MODELS[0].poseMeta.forEach((pose, i) => {{
   const button = document.createElement('button');
   button.textContent = pose.label;
   button.style.setProperty('--pill', pose.accent);
@@ -255,34 +303,94 @@ currentPoseMeta.forEach((pose, i) => {{
   posesEl.appendChild(button);
 }});
 
-function select(modelIndex, poseIndex) {{
-  mi = (modelIndex + MODELS.length) % MODELS.length;
-  pi = (poseIndex + currentPoseMeta.length) % currentPoseMeta.length;
-  const model = MODELS[mi];
-  const pose = currentPoseMeta[pi];
+const liveButton = document.createElement('button');
+liveButton.textContent = '▶ 待機ループ';
+liveButton.style.setProperty('--pill', '#64b5a0');
+liveButton.addEventListener('click', () => startLive());
+posesEl.appendChild(liveButton);
+
+function updateStats(model) {{
+  const stats = model.stats?.stats;
+  if (!stats) return;
+  document.getElementById('st-items').textContent = stats.items;
+  document.getElementById('st-tris').textContent = stats.triangles.toLocaleString();
+  document.getElementById('st-mask').textContent = stats.mask_sources;
+  document.getElementById('st-tex').textContent = model.stats.width + '×' + model.stats.height;
+}}
+
+function setImage(src, label, vars) {{
   view.classList.add('swap');
   setTimeout(() => {{
-    view.src = model.poses[pose.id];
+    view.src = src;
     view.classList.remove('swap');
-  }}, 100);
+  }}, 80);
+  nameEl.textContent = label;
+  varsEl.textContent = vars;
+}}
+
+function select(modelIndex, poseIndex) {{
+  stopLive();
+  mi = (modelIndex + MODELS.length) % MODELS.length;
+  const model = MODELS[mi];
+  pi = (poseIndex + model.poseMeta.length) % model.poseMeta.length;
+  const pose = model.poseMeta[pi];
+  setImage(model.poses[pose.id], model.label + ' · ' + pose.label,
+           pose.id === 'neutral' ? 'base state' : pose.id);
   [...modelsEl.children].forEach((el, i) => el.classList.toggle('active', i === mi));
   [...posesEl.children].forEach((el, i) => el.classList.toggle('active', i === pi));
-  nameEl.textContent = model.label + ' · ' + pose.label;
-  varsEl.textContent = pose.id === 'neutral' ? 'base state' : pose.id;
-  const stats = model.stats?.stats;
-  if (stats) {{
-    document.getElementById('st-items').textContent = stats.items;
-    document.getElementById('st-tris').textContent = stats.triangles.toLocaleString();
-    document.getElementById('st-mask').textContent = stats.mask_sources;
-    document.getElementById('st-tex').textContent = model.stats.width + '×' + model.stats.height;
+  liveButton.classList.remove('active');
+  updateStats(model);
+}}
+
+function startLive() {{
+  const model = MODELS[mi];
+  if (!model.anim.length) {{
+    varsEl.textContent = 'このモデルには待機ループがありません';
+    return;
+  }}
+  stopLive();
+  playing = true;
+  frame = 0;
+  [...modelsEl.children].forEach((el, i) => el.classList.toggle('active', i === mi));
+  [...posesEl.children].forEach((el, i) => el.classList.toggle('active', false));
+  liveButton.classList.add('active');
+  const tick = () => {{
+    const current = MODELS[mi];
+    view.src = current.anim[frame % current.anim.length];
+    nameEl.textContent = current.label + ' · 待機ループ';
+    varsEl.textContent = 'timeline: 待機ループ00';
+  }};
+  tick();
+  timer = setInterval(() => {{
+    frame += 1;
+    tick();
+  }}, 150);
+  updateStats(model);
+}}
+
+function stopLive() {{
+  playing = false;
+  if (timer !== null) {{
+    clearInterval(timer);
+    timer = null;
   }}
 }}
 
 window.addEventListener('keydown', (event) => {{
   if (event.key === 'ArrowRight') select(mi, pi + 1);
   if (event.key === 'ArrowLeft') select(mi, pi - 1);
-  if (event.key === 'ArrowDown') select(mi + 1, pi);
-  if (event.key === 'ArrowUp') select(mi - 1, pi);
+  if (event.key === 'ArrowDown') {{
+    mi = (mi + 1) % MODELS.length;
+    if (playing) startLive(); else select(mi, pi);
+  }}
+  if (event.key === 'ArrowUp') {{
+    mi = (mi - 1 + MODELS.length) % MODELS.length;
+    if (playing) startLive(); else select(mi, pi);
+  }}
+  if (event.key === ' ') {{
+    event.preventDefault();
+    if (playing) select(mi, pi); else startLive();
+  }}
 }});
 
 select(0, 0);

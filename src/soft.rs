@@ -381,6 +381,23 @@ fn render_with_textures(
             }
         }
         stats.mask_sources += source_count;
+        if let Ok(dir) = std::env::var("YU_EMOTE_DUMP_MASKS") {
+            let mut pgm = format!(
+                "P5
+{} {}
+255
+",
+                width, height
+            )
+            .into_bytes();
+            pgm.extend(
+                buffer
+                    .iter()
+                    .map(|value| (value.clamp(0.0, 1.0) * 255.0) as u8),
+            );
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(format!("{dir}/mask-{group_id}.pgm"), pgm);
+        }
         masks.push(Some(buffer));
     }
 

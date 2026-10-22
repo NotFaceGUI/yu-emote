@@ -28,7 +28,9 @@ The renderer is usable today for real game data: the YU-RIS test model and
 four Nekopara maid models produce complete characters with correct
 rear-hair/face/front-hair layering and variable-driven expressions.
 [`demo/make_demo.py`](demo/make_demo.py) builds a self-contained character +
-expression demo page (`target/emote-demo/index.html`) from those models.
+expression + idle-loop demo page (`target/emote-demo/index.html`) from those
+models. Every pose and animation frame uses one fixed camera, so tilting or
+breathing never changes the character's apparent size.
 
 ## Usage
 

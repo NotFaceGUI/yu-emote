@@ -98,10 +98,11 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   interpolation, `ti` quantization), channel-wise `inheritMask`,
   `transformOrder`, nested type-3 motions, motion-local `parameter` tables,
   motion-level `parameterize` (eyes/mouth/brows/tears/cheeks), and the native
-  draw order: emission by `priority`, final sort by resolved Z. Parameterized
-  deformer-mesh inheritance (`mesh_bp` on a blank layer warping its children)
-  is the remaining pose gap; non-zero easing and the official frame rate still
-  need oracle evidence.
+  draw order: emission by `priority`, final sort by resolved Z. `psb-render`
+  can play a timeline by name (`--timeline`, `--seconds`, `--loop`).
+  Parameterized deformer-mesh inheritance (`mesh_bp` on a blank layer warping
+  its children) is the remaining pose gap; non-zero easing and the official
+  frame rate still need oracle evidence.
 - **M3 (baseline done)** all 58 official shader variants are committed as WGSL
   files under `shaders/`; `plan` turns a pose into textured mesh draw items and
   `soft` rasterizes it deterministically for validation/PNG output. Composite
