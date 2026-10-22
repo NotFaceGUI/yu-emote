@@ -93,16 +93,20 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
   behavior references; no code was copied.
 - **M2 (core done)** `Animator` for variables/timelines; `pose` evaluates
-  layer frame lists (type 0 hold, type 3 interpolation, `ti` quantization),
-  channel-wise `inheritMask`, `transformOrder`, nested type-3 motions and the
-  motion `priority` draw order. Alpha-mask/stencil composition is the remaining
-  visual gap; the official frame rate and non-zero easing still need oracle
-  evidence.
+  layer frame lists (type 0 hold from the preceding keyframe, type 3
+  interpolation, `ti` quantization), channel-wise `inheritMask`,
+  `transformOrder`, nested type-3 motions, motion-local `parameter` tables,
+  motion-level `parameterize` (eyes/mouth/brows/tears/cheeks), and the native
+  draw order: emission by `priority`, final sort by resolved Z. Parameterized
+  deformer-mesh inheritance (`mesh_bp` on a blank layer warping its children)
+  is the remaining pose gap; non-zero easing and the official frame rate still
+  need oracle evidence.
 - **M3 (baseline done)** all 58 official shader variants are committed as WGSL
   files under `shaders/`; `plan` turns a pose into textured mesh draw items and
-  `soft` rasterizes it deterministically for validation/PNG output. The wgpu
-  pipeline, stencil/mask compositing and the runtime's variant-selection rules
-  are the remaining work.
+  `soft` rasterizes it deterministically for validation/PNG output. Composite
+  alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) are resolved
+  per motion scope and rasterized into coverage buffers. The wgpu pipeline,
+  pixelate pass and the runtime's shader-variant selection rules remain.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.
 

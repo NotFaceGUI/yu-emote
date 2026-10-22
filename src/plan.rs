@@ -11,16 +11,16 @@
 //!   (public-tooling behavior, pending official parity).
 //! - `src == "blank"` layers are mask/deformation proxies, not color draws;
 //!   they are skipped and counted.
-//! - Stencil/alpha-mask composition is not applied here yet; items carry
-//!   `stencil_type` and the layer `mask` for the later compositor.
-//! - Vertex color channel order is assumed to be `0xAARRGGBB`; sample data is
-//!   white so this still needs an oracle check.
+//! - Composite masks are resolved by [`crate::soft`] from the plan's
+//!   [`MaskGroup`] list; items carry `mask_group`, `stencil_type` and `mask`.
+//! - Vertex color channel order is `0xRRGGBBAA` (low byte alpha), evidenced by
+//!   the eyelid layer's opaque-black `0x000000FF`.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::pose::{Affine2, LayerPose, Pose};
+use crate::pose::{Affine2, LayerPose, MaskGroup, Pose};
 use crate::render::{MeshGrid, MeshPatch};
 use crate::schema::{AtlasIcon, IconRef, Model, TextureSource};
 
@@ -58,6 +58,10 @@ pub struct DrawItem {
     pub mesh_division: u32,
     /// `stencilType` from the layer.
     pub stencil_type: i64,
+    /// Composite-mask group inherited from a type-12 owner.
+    pub mask_group: Option<usize>,
+    /// Motion scope used to resolve `stencilCompositeMaskLayerList` labels.
+    pub scope: usize,
     /// Layer mask bits.
     pub mask: i64,
     /// Vertices.
@@ -75,6 +79,8 @@ pub struct RenderPlan {
     pub height: u32,
     /// Draw items in traversal order.
     pub items: Vec<DrawItem>,
+    /// Composite-mask owners reachable from this pose.
+    pub mask_groups: Vec<MaskGroup>,
     /// Layers skipped, keyed by reason.
     pub skipped: BTreeMap<String, usize>,
 }
@@ -99,6 +105,7 @@ impl RenderPlan {
             width,
             height,
             items,
+            mask_groups: pose.mask_groups.clone(),
             skipped,
         }
     }
@@ -176,39 +183,20 @@ impl RenderPlan {
 
 fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'static str> {
     let src = layer.state.src.as_deref().ok_or("no-src")?;
-    // `blank` is the engine's white/no-texture page; mask and fill layers use
-    // it. Treat it as a 1x1 white texture so the software path can composite
-    // fills; the official mask/stencil rules still need M4 evidence.
-    let blank = src == "blank";
-    let page = if blank {
-        None
-    } else {
-        Some(
-            model
-                .sources
-                .iter()
-                .find(|page| page.name == src)
-                .ok_or("missing-page")?,
-        )
-    };
+    // `blank` layers are structural proxies (deformers, type-12 stencil
+    // owners and mask placement nodes), not color geometry. Drawing them as
+    // white quads covers the face and hair; the official renderer only uses
+    // them while building stencil state.
+    if src == "blank" {
+        return Err("blank-proxy");
+    }
+    let page = model
+        .sources
+        .iter()
+        .find(|page| page.name == src)
+        .ok_or("missing-page")?;
     let icon_ref = layer.state.icon.as_ref().ok_or("no-icon")?;
-    let (icon, _explicit) = if blank {
-        let rect = icon_ref.rect.ok_or("missing-icon")?;
-        (
-            AtlasIcon {
-                attr: None,
-                left: rect[0],
-                top: rect[1],
-                width: rect[2],
-                height: rect[3],
-                origin_x: 0.0,
-                origin_y: 0.0,
-            },
-            true,
-        )
-    } else {
-        resolve_icon(page.ok_or("missing-page")?, icon_ref).ok_or("missing-icon")?
-    };
+    let (icon, _explicit) = resolve_icon(page, icon_ref).ok_or("missing-icon")?;
     if icon.width <= 0.0 || icon.height <= 0.0 {
         return Err("zero-size");
     }
@@ -216,8 +204,8 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
     let height = icon.height as f32;
     let origin_x = icon.origin_x as f32;
     let origin_y = icon.origin_y as f32;
-    let page_width = page.map(|page| page.width).unwrap_or(1).max(1);
-    let page_height = page.map(|page| page.height).unwrap_or(1).max(1);
+    let page_width = page.width.max(1);
+    let page_height = page.height.max(1);
     let world = layer.world;
 
     let (vertices, indices, mesh) = if layer.state.mesh_bp.is_some() {
@@ -229,14 +217,10 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
             .map(|vertex| PlanVertex {
                 position: transform_point(world, [vertex.x - origin_x, vertex.y - origin_y]),
                 color: mesh_color(layer, vertex.u, vertex.v),
-                uv: if blank {
-                    [0.5, 0.5]
-                } else {
-                    [
-                        (icon.left as f32 + vertex.u * width) / page_width as f32,
-                        (icon.top as f32 + vertex.v * height) / page_height as f32,
-                    ]
-                },
+                uv: [
+                    (icon.left as f32 + vertex.u * width) / page_width as f32,
+                    (icon.top as f32 + vertex.v * height) / page_height as f32,
+                ],
             })
             .collect();
         (vertices, grid.indices, true)
@@ -247,28 +231,24 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
             [0.0 - origin_x, height - origin_y],
             [width - origin_x, height - origin_y],
         ];
-        let uvs = if blank {
-            [[0.5, 0.5]; 4]
-        } else {
+        let uvs = [
             [
-                [
-                    icon.left as f32 / page_width as f32,
-                    icon.top as f32 / page_height as f32,
-                ],
-                [
-                    (icon.left as f32 + width) / page_width as f32,
-                    icon.top as f32 / page_height as f32,
-                ],
-                [
-                    icon.left as f32 / page_width as f32,
-                    (icon.top as f32 + height) / page_height as f32,
-                ],
-                [
-                    (icon.left as f32 + width) / page_width as f32,
-                    (icon.top as f32 + height) / page_height as f32,
-                ],
-            ]
-        };
+                icon.left as f32 / page_width as f32,
+                icon.top as f32 / page_height as f32,
+            ],
+            [
+                (icon.left as f32 + width) / page_width as f32,
+                icon.top as f32 / page_height as f32,
+            ],
+            [
+                icon.left as f32 / page_width as f32,
+                (icon.top as f32 + height) / page_height as f32,
+            ],
+            [
+                (icon.left as f32 + width) / page_width as f32,
+                (icon.top as f32 + height) / page_height as f32,
+            ],
+        ];
         let vertices = corners
             .iter()
             .zip(uvs.iter())
@@ -286,13 +266,15 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
         label: layer.label.clone(),
         path: layer.path.clone(),
         page: src.to_string(),
-        resource: page.and_then(|page| page.resource),
+        resource: page.resource,
         page_width,
         page_height,
         blend_mode: layer.state.blend_mode,
         mesh,
         mesh_division: layer.mesh_division,
         stencil_type: layer.stencil_type,
+        mask_group: layer.mask_group,
+        scope: layer.scope,
         mask: layer.state.mask,
         vertices,
         indices,
@@ -319,13 +301,14 @@ fn resolve_icon(page: &TextureSource, icon_ref: &IconRef) -> Option<(AtlasIcon, 
 }
 
 fn corner_color(layer: &LayerPose, index: usize) -> [f32; 4] {
-    // Official frame colors are four corner colors authored as 0xAARRGGBB;
-    // multiply alpha by the accumulated layer opacity.
-    let argb = layer.state.color[index.min(3)];
-    let a = ((argb >> 24) & 0xFF) as f32 / 255.0 * layer.opacity as f32;
-    let r = ((argb >> 16) & 0xFF) as f32 / 255.0;
-    let g = ((argb >> 8) & 0xFF) as f32 / 255.0;
-    let b = (argb & 0xFF) as f32 / 255.0;
+    // Official frame colors are four corner colors stored as 0xRRGGBBAA
+    // (eluna's `corner_colors` byte order); alpha is the low byte and is
+    // multiplied by the accumulated layer opacity.
+    let rgba = layer.state.color[index.min(3)];
+    let r = ((rgba >> 24) & 0xFF) as f32 / 255.0;
+    let g = ((rgba >> 16) & 0xFF) as f32 / 255.0;
+    let b = ((rgba >> 8) & 0xFF) as f32 / 255.0;
+    let a = (rgba & 0xFF) as f32 / 255.0 * layer.opacity as f32;
     [r, g, b, a]
 }
 
@@ -355,7 +338,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_is_argb() {
+    fn color_is_rgba() {
         let layer = LayerPose {
             label: String::new(),
             path: String::new(),
@@ -375,13 +358,15 @@ mod tests {
             mesh_transform: 0,
             mesh_combine: false,
             stencil_type: 0,
+            mask_group: None,
+            scope: 0,
             priority_path: Vec::new(),
             children: Vec::new(),
         };
         let color = corner_color(&layer, 0);
-        assert!((color[0] - 1.0).abs() < 1e-6);
-        assert!((color[1] - (128.0 / 255.0)).abs() < 1e-6);
-        assert!((color[2] - (64.0 / 255.0)).abs() < 1e-6);
-        assert!((color[3] - (128.0 / 255.0)).abs() < 1e-6);
+        assert!((color[0] - (128.0 / 255.0)).abs() < 1e-6);
+        assert!((color[1] - 1.0).abs() < 1e-6);
+        assert!((color[2] - (128.0 / 255.0)).abs() < 1e-6);
+        assert!((color[3] - (64.0 / 255.0)).abs() < 1e-6);
     }
 }

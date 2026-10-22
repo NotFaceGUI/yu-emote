@@ -207,12 +207,33 @@ pub fn evaluate_frames(frames: &[Frame], time: f64, previous: Option<&FrameState
     };
 
     if current.kind == 0 {
-        let mut held = previous.cloned().unwrap_or_else(|| state.clone());
-        held.frame_index = Some(current_index);
-        held.frame_start = current.time as f64;
-        held.kind = 0;
-        held.interpolation_t = 0.0;
-        return held;
+        // A type-0 terminal frame holds the last authored keyframe. The
+        // previous state may live in an earlier frame of the same list (the
+        // nested eye/mouth motions rely on this), so search backwards before
+        // falling back to the caller-provided state.
+        for previous_frame in frames[..current_index].iter().rev() {
+            if let Some(content) = &previous_frame.content {
+                let mut held = FrameState {
+                    frame_index: Some(current_index),
+                    frame_start: current.time as f64,
+                    kind: 0,
+                    valid: true,
+                    ..FrameState::default()
+                };
+                held.apply_content(content);
+                held.interpolation_t = 0.0;
+                return held;
+            }
+        }
+        if let Some(previous) = previous {
+            let mut held = previous.clone();
+            held.frame_index = Some(current_index);
+            held.frame_start = current.time as f64;
+            held.kind = 0;
+            held.interpolation_t = 0.0;
+            return held;
+        }
+        return state;
     }
 
     let Some(content) = &current.content else {
@@ -548,10 +569,27 @@ pub struct LayerPose {
     pub mesh_combine: bool,
     /// `stencilType`.
     pub stencil_type: i64,
+    /// Composite-mask group inherited from the nearest type-12 owner with
+    /// `stencilType & 4` and a non-empty `stencilCompositeMaskLayerList`.
+    pub mask_group: Option<usize>,
+    /// Motion scope this layer was evaluated in (nested motions get their own
+    /// scope, so equal labels in the left/right eye never alias).
+    pub scope: usize,
     /// Draw-order key: rank path from `priority` frames.
     pub priority_path: Vec<i64>,
     /// Child layers.
     pub children: Vec<LayerPose>,
+}
+
+/// One composite alpha-mask owner (`stencilType & 4`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaskGroup {
+    /// Owner layer path (diagnostics only).
+    pub owner_path: String,
+    /// Motion scope the owner belongs to; source labels resolve here.
+    pub owner_scope: usize,
+    /// `stencilCompositeMaskLayerList` labels.
+    pub sources: Vec<String>,
 }
 
 /// A full motion pose at one time.
@@ -565,6 +603,8 @@ pub struct Pose {
     pub time: f64,
     /// Variables used for parameterized layers.
     pub variables: BTreeMap<String, f64>,
+    /// Composite-mask owners encountered during traversal.
+    pub mask_groups: Vec<MaskGroup>,
     /// Root layers.
     pub layers: Vec<LayerPose>,
 }
@@ -605,9 +645,12 @@ impl Pose {
             coordinate: 0,
             opacity: 1.0,
             visible: true,
+            mask_group: None,
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
+        let mut mask_groups = Vec::new();
+        let mut next_scope = 1usize;
         let mut layers = Vec::with_capacity(motion.layers.len());
         for (index, layer) in motion.layers.iter().enumerate() {
             layers.push(evaluate_layer(
@@ -619,7 +662,12 @@ impl Pose {
                 &root,
                 0,
                 &ranks,
+                &motion.parameters,
                 &[],
+                0,
+                None,
+                &mut mask_groups,
+                &mut next_scope,
                 &mut counter,
             ));
         }
@@ -628,6 +676,7 @@ impl Pose {
             motion: motion_name.to_string(),
             time,
             variables: variables.clone(),
+            mask_groups,
             layers,
         }
     }
@@ -644,7 +693,17 @@ impl Pose {
         }
         let mut out = Vec::new();
         walk(&self.layers, &mut out);
-        out.sort_by(|a, b| a.priority_path.cmp(&b.priority_path));
+        // The native manager emits DrawFrameInfos in `priority` order and then
+        // sorts them by resolved Z (`LayerInfo +620`, copied to DFI +36). Z is
+        // the accumulated coordinate Z, so rear hair (-10) precedes the face
+        // (3) and the front hair (4) precedes the eyes (5/6). Priority order
+        // is only the deterministic tie-break for equal Z.
+        out.sort_by(|a, b| {
+            a.world_origin[2]
+                .total_cmp(&b.world_origin[2])
+                .then_with(|| a.priority_path.cmp(&b.priority_path))
+                .then_with(|| a.path.cmp(&b.path))
+        });
         out
     }
 }
@@ -656,6 +715,7 @@ struct Context {
     coordinate: i64,
     opacity: f64,
     visible: bool,
+    mask_group: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,7 +728,12 @@ fn evaluate_layer(
     parent: &Context,
     depth: usize,
     ranks: &BTreeMap<i64, i64>,
+    motion_parameters: &[crate::schema::ParameterDef],
     priority_prefix: &[i64],
+    scope: usize,
+    inherited_mask_group: Option<usize>,
+    mask_groups: &mut Vec<MaskGroup>,
+    next_scope: &mut usize,
     counter: &mut i64,
 ) -> LayerPose {
     let layer_index = *counter;
@@ -676,8 +741,13 @@ fn evaluate_layer(
     let rank = ranks.get(&layer_index).copied().unwrap_or(layer_index);
     let mut priority_path = priority_prefix.to_vec();
     priority_path.push(rank);
-    let sample_time =
-        parameter_time(model, layer.parameterize.as_ref(), variables).unwrap_or(fallback_time);
+    let sample_time = parameter_time(
+        model,
+        motion_parameters,
+        layer.parameterize.as_ref(),
+        variables,
+    )
+    .unwrap_or(fallback_time);
     let state = evaluate_frames(&layer.frames, sample_time, None);
     let inherit_mask = layer.inherit_mask.unwrap_or(0);
     let base_opacity = if (inherit_mask & INHERIT_OPACITY) != 0 {
@@ -721,6 +791,22 @@ fn evaluate_layer(
     let visible_chain = parent.visible && opacity > 0.0;
     let visible = visible_chain && drawable && has_geometry;
 
+    // `stencilType & 4` marks a composite-mask owner. Its descendants are
+    // clipped by the union of the named source layers, resolved in this
+    // motion scope (native sub_103390C0 second pass).
+    let mut child_mask_group = inherited_mask_group;
+    if layer.stencil_type.unwrap_or(0) & 0x4 != 0
+        && !layer.stencil_composite_mask_layer_list.is_empty()
+    {
+        let id = mask_groups.len();
+        mask_groups.push(MaskGroup {
+            owner_path: path.to_string(),
+            owner_scope: scope,
+            sources: layer.stencil_composite_mask_layer_list.clone(),
+        });
+        child_mask_group = Some(id);
+    }
+
     let context = Context {
         world,
         world_origin,
@@ -728,6 +814,7 @@ fn evaluate_layer(
         coordinate: layer.coordinate.unwrap_or(0),
         opacity,
         visible: visible_chain,
+        mask_group: child_mask_group,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -738,12 +825,20 @@ fn evaluate_layer(
                 model,
                 child,
                 &format!("{path}/{index}"),
-                sample_time,
+                // Parameterization is local to the layer: children keep the
+                // player/motion timeline for their own frames unless they are
+                // parameterized themselves.
+                fallback_time,
                 variables,
                 &context,
                 depth + 1,
                 ranks,
+                motion_parameters,
                 priority_prefix,
+                scope,
+                child_mask_group,
+                mask_groups,
+                next_scope,
                 counter,
             )
         })
@@ -755,9 +850,28 @@ fn evaluate_layer(
     if layer.kind == 3 && depth < MAX_NESTED_MOTION_DEPTH {
         if let (Some(object_name), Some(icon)) = (&state.src, &state.icon) {
             if let Some(nested) = model.motion(object_name, &icon.raw) {
+                // A referenced motion may declare its own `parameterize` index
+                // (eyes/mouth/brows/tears/cheeks). That variable drives the
+                // nested motion's timeline even when the proxy layer has no
+                // parameterize of its own.
+                let nested_base = if let Some(index) = nested.parameterize {
+                    parameter_time(
+                        model,
+                        &nested.parameters,
+                        Some(&ParameterRef::Index(index)),
+                        variables,
+                    )
+                    .unwrap_or(fallback_time)
+                } else if layer.parameterize.is_some() {
+                    sample_time
+                } else {
+                    fallback_time
+                };
                 let child_time =
-                    (sample_time - state.frame_start + state.motion_time_offset).max(0.0);
+                    (nested_base - state.frame_start + state.motion_time_offset).max(0.0);
                 let nested_ranks = nested.priority_ranks(child_time);
+                let nested_scope = *next_scope;
+                *next_scope += 1;
                 let mut nested_counter = 0i64;
                 for (index, nested_layer) in nested.layers.iter().enumerate() {
                     children.push(evaluate_layer(
@@ -769,7 +883,12 @@ fn evaluate_layer(
                         &context,
                         depth + 1,
                         &nested_ranks,
+                        &nested.parameters,
                         &priority_path,
+                        nested_scope,
+                        context.mask_group,
+                        mask_groups,
+                        next_scope,
                         &mut nested_counter,
                     ));
                 }
@@ -793,6 +912,8 @@ fn evaluate_layer(
         mesh_transform: layer.mesh_transform.unwrap_or(0),
         mesh_combine: layer.mesh_combine.unwrap_or(0) != 0,
         stencil_type: layer.stencil_type.unwrap_or(0),
+        mask_group: inherited_mask_group,
+        scope,
         priority_path,
         children,
     }
@@ -820,17 +941,24 @@ fn map_coordinate(parent: &Context, coord: [f64; 3]) -> ([f64; 2], [f64; 3]) {
 
 /// Parameter sample time for a layer.
 ///
-/// `layer.parameterize` resolves either to an index in the root `parameter`
-/// table or to an inline object. The value is optionally truncated
-/// (`discretization`), clamped to the authored range, then mapped with
-/// `division` into the layer-local frame time.
+/// `layer.parameterize` resolves to an index in the **owning motion's**
+/// `parameter` table (or to an inline object). The value is optionally
+/// truncated (`discretization`), clamped to the authored range, then mapped
+/// with `division` into the layer-local frame time.
 pub fn parameter_time(
     model: &Model,
+    motion_parameters: &[crate::schema::ParameterDef],
     reference: Option<&ParameterRef>,
     variables: &BTreeMap<String, f64>,
 ) -> Option<f64> {
     let reference = reference?;
-    let Some(parameter) = model.parameter(reference) else {
+    let resolved = match reference {
+        ParameterRef::Index(index) if *index >= 0 => {
+            motion_parameters.get(*index as usize).cloned()
+        }
+        _ => model.parameter(reference),
+    };
+    let Some(parameter) = resolved else {
         // A parameterized layer with an unresolved index samples time 0 in the
         // official runtime (the parameter table is absent or shorter).
         return Some(0.0);
@@ -838,9 +966,10 @@ pub fn parameter_time(
     let Some(id) = parameter.id else {
         return Some(0.0);
     };
-    let Some(value) = variables.get(&id).copied() else {
-        return Some(0.0);
-    };
+    // A variable that was never set has the E-mote neutral value 0, which is
+    // then mapped through the authored range (for -30..30 that is frame 30,
+    // not frame 0).
+    let value = variables.get(&id).copied().unwrap_or(0.0);
     let mut sample = if parameter.discretization {
         value.trunc()
     } else {

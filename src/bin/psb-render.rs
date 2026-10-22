@@ -23,7 +23,8 @@ fn main() -> ExitCode {
     let Some(path) = args.next() else {
         eprintln!(
             "usage: psb-render <model.psb> [--key HEX] [--object NAME] [--motion NAME] \
-             [--time FRAMES] [--var NAME=VALUE]... [--out FILE.png]"
+             [--time FRAMES] [--var NAME=VALUE]... [--out FILE.png] \
+             [--only LABEL] [--skip LABEL]"
         );
         return ExitCode::FAILURE;
     };
@@ -36,6 +37,8 @@ fn main() -> ExitCode {
     let mut fit = true;
     let mut margin = 20.0f32;
     let mut scale_override: Option<f32> = None;
+    let mut only: Option<String> = None;
+    let mut skip: Option<String> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--key" => match args.next().as_deref().map(parse_key) {
@@ -93,6 +96,8 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--only" => only = args.next(),
+            "--skip" => skip = args.next(),
             other => {
                 eprintln!("unknown argument `{other}`");
                 return ExitCode::FAILURE;
@@ -125,7 +130,7 @@ fn main() -> ExitCode {
         eprintln!("no motion `{object}/{motion}`");
         return ExitCode::FAILURE;
     };
-    let plan = yu_emote::plan::RenderPlan::build(&model, &pose);
+    let mut plan = yu_emote::plan::RenderPlan::build(&model, &pose);
     let view = if let Some(scale) = scale_override {
         let (min, max) = plan.bounds().unwrap_or(([0.0; 2], [1.0; 2]));
         let center = [(min[0] + max[0]) * 0.5, (min[1] + max[1]) * 0.5];
@@ -141,6 +146,14 @@ fn main() -> ExitCode {
     } else {
         soft::ViewTransform::identity()
     };
+    if let Some(needle) = &only {
+        plan.items
+            .retain(|item| item.label.contains(needle.as_str()));
+    }
+    if let Some(needle) = &skip {
+        plan.items
+            .retain(|item| !item.label.contains(needle.as_str()));
+    }
     let (image, stats) = match soft::render_plan_with_document(&document, &model, &plan, view) {
         Ok(rendered) => rendered,
         Err(error) => {
@@ -170,7 +183,7 @@ fn main() -> ExitCode {
             eprintln!("{path}: {error}");
             return ExitCode::FAILURE;
         }
-        println!("wrote {path}");
+        eprintln!("wrote {path}");
     }
     ExitCode::SUCCESS
 }

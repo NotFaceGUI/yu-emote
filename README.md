@@ -17,15 +17,17 @@ native + `wasm32` use.
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
 | Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
-| Layer/frame evaluation, nested motions, `priority` draw order (`psb-pose`) | ✅ M2 core (stencil/mask composition pending) |
-| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG) | ✅ M3 baseline (wgpu pipeline + official parity pending) |
-| Part visibility / normalization rules | ⏳ M1 remainder (evidence pending) |
+| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order (`psb-pose`) | ✅ M2 core (parameterized deformer-mesh inheritance pending) |
+| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG) | ✅ M3 baseline |
+| Composite alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) in the CPU path | ✅ M3 core |
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
-This repository intentionally does **not** claim rendering yet. The first
-milestone is a trustworthy data layer; animation and rendering follow the task
-book in the kernel repo (`docs/tasks/task-emote-runtime.md`).
+The renderer is usable today for the official test model: a real-game
+`emote_test.psb` produces a complete character with correct rear-hair/face/front-
+hair layering and variable-driven expressions. [`demo/make_demo.py`](demo/make_demo.py)
+builds a self-contained demo page (`target/emote-demo/index.html`) from 11
+rendered poses.
 
 ## Usage
 
@@ -45,6 +47,15 @@ cargo run --bin psb-dump -- model.psb --key 0x175058c9 --raw --resources out --d
 cargo run --bin psb-pose -- model.psb --key 0x175058c9 --time 0
 cargo run --bin psb-plan -- model.psb --key 0x175058c9 --time 0
 cargo run --bin psb-render -- model.psb --key 0x175058c9 --time 0 --out out.png
+
+# Expression/pose variants (variables map through the motion-local parameter table)
+cargo run --bin psb-render -- model.psb --key 0x175058c9 --time 0 \
+  --var face_mouth=30 --var face_eyebrow=40 --out smile.png
+
+# Self-contained demo page (11 poses embedded as PNG)
+cargo build --bins
+python demo/make_demo.py --psb /path/to/emote_test.psb --key 0x175058c9
+# → target/emote-demo/index.html
 ```
 
 Verified against the YU-RIS ERIS sample `emote_test.psb` (PSB v2, body key
@@ -81,6 +92,29 @@ are recorded here so the implementation can be audited against them:
   flag / numeric variables; numeric fades are converted with `value * 0.06`
   before reaching the player. `EMOTEINFO` calls player slot 45. Details and
   remaining gaps are in the kernel's `docs/emote-parity.md`.
+- **Draw order.** The native manager emits sprites in `priority` order, then
+  sorts them by resolved Z (`LayerInfo +620`, copied to DrawFrameInfo +36)
+  ascending; `priority` is only the deterministic tie-break. Using `priority`
+  alone puts rear hair in front of the face. Verified with the sample:
+  rear hair `z=-10`, body `0`, face `3`, front hair `4`, eyes `5..6`.
+- **Color order.** Frame corner colors are `0xRRGGBBAA` (low byte alpha), not
+  `0xAARRGGBB`; the eyelid layer relies on `0x000000FF` being opaque black.
+- **Parameter tables are motion-local.** `parameterize` indexes the owning
+  motion's `parameter` array, and a referenced motion can itself carry
+  `parameterize` (eyes/mouth/brows/tears/cheeks). A missing variable has the
+  neutral value `0`, which is then mapped through `rangeBegin..rangeEnd`.
+- **Frame hold.** A type-0 terminal frame holds the last authored keyframe in
+  the same list; nested eye/mouth motions use this to stay visible after a
+  type-0 gap.
+- **Composite masks.** A type-12 layer with `stencilType & 4` and a non-empty
+  `stencilCompositeMaskLayerList` clips its descendants by the union of the
+  named source layers (resolved in the same motion scope). The CPU renderer
+  rasterizes those sources into a coverage buffer; `add_mask` with opacity 0 is
+  not a source (matching the native visible-sprite filter).
+- **YSEmote ABI.** The exported wrappers are **stdcall** (`RET imm`); declaring
+  them `__cdecl` corrupts the stack after a few updates. Ordinal 254 calls
+  player vtable `+0xd4` (`Update(seconds)`), ordinal 255 calls `+0xd8`, which
+  forwards to the device renderer at `[impl+8]`.
 
 ```rust
 use yu_emote::model::ModelSummary;

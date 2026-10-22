@@ -179,16 +179,21 @@ fn parameter_time_clamps_and_scales() {
     variables.insert("mouth".to_string(), 4.0);
     let reference = ParameterRef::Index(0);
     assert_eq!(
-        parameter_time(&model, Some(&reference), &variables),
+        parameter_time(&model, &model.parameters, Some(&reference), &variables),
         Some(2.0)
     );
     variables.insert("mouth".to_string(), 100.0);
     assert_eq!(
-        parameter_time(&model, Some(&reference), &variables),
+        parameter_time(&model, &model.parameters, Some(&reference), &variables),
         Some(5.0)
     );
     assert_eq!(
-        parameter_time(&model, Some(&ParameterRef::Index(99)), &variables),
+        parameter_time(
+            &model,
+            &model.parameters,
+            Some(&ParameterRef::Index(99)),
+            &variables
+        ),
         Some(0.0)
     );
 }

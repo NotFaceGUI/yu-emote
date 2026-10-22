@@ -7,13 +7,15 @@
 //!
 //! Implemented:
 //! - textured triangles with bilinear sampling (clamp-to-edge);
-//! - vertex corner colors (`0xAARRGGBB`) multiplied with the texel;
+//! - vertex corner colors (`0xRRGGBBAA`) multiplied with the texel;
 //! - straight-alpha source-over blending;
-//! - mesh and quad items from [`RenderPlan`].
+//! - mesh and quad items from [`RenderPlan`];
+//! - composite alpha masks (`stencilType & 4`): sources are rasterized into
+//!   per-group coverage buffers and multiply descendant alpha.
 //!
 //! Not implemented (counted in [`SoftStats`]):
 //! - non-normal blend modes (`bm` other than the default 0x10);
-//! - alpha-mask / stencil composition;
+//! - the type-7 clip rectangle;
 //! - pixelate screen-space pass.
 
 use std::collections::BTreeMap;
@@ -92,8 +94,10 @@ pub struct SoftStats {
     pub missing_textures: usize,
     /// Items using a non-default blend mode (rendered with normal alpha).
     pub unsupported_blend: usize,
-    /// Items carrying mask/stencil state (not composed yet).
+    /// Items carrying mask/stencil state.
     pub masked_items: usize,
+    /// Source draw items rasterized into composite-mask buffers.
+    pub mask_sources: usize,
 }
 
 /// Presentation transform applied to plan vertices before rasterization.
@@ -165,6 +169,7 @@ fn rasterize_triangle(
     v1: &PlanVertex,
     v2: &PlanVertex,
     view: ViewTransform,
+    mask: Option<&[f32]>,
 ) -> usize {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
@@ -205,13 +210,21 @@ fn rasterize_triangle(
                 v0.color[3] * w0 + v1.color[3] * w1 + v2.color[3] * w2,
             ];
             let texel = sample_bilinear(texture, uv);
+            let index = (y as usize * width as usize + x as usize) * 4;
+            let mut alpha = color[3];
+            if let Some(mask) = mask {
+                let coverage = mask[y as usize * width as usize + x as usize];
+                if coverage <= 0.003 {
+                    continue;
+                }
+                alpha *= coverage;
+            }
             let src = [
                 texel[0] * color[0],
                 texel[1] * color[1],
                 texel[2] * color[2],
-                texel[3] * color[3],
+                texel[3] * alpha,
             ];
-            let index = (y as usize * width as usize + x as usize) * 4;
             blend_source_over(&mut target[index..index + 4], src);
             covered += 1;
         }
@@ -329,18 +342,64 @@ fn render_with_textures(
     let height = plan.height.max(1);
     let mut rgba8 = vec![0u8; width as usize * height as usize * 4];
     let mut stats = SoftStats::default();
+
+    // Composite alpha masks (`stencilType & 4`). Each owner's named source
+    // layers are rasterized into a coverage buffer in the same motion scope;
+    // descendants are then multiplied by that coverage. This mirrors the
+    // native inner-stencil union plus the shader's alpha discard.
+    let mut masks: Vec<Option<Vec<f32>>> = Vec::with_capacity(plan.mask_groups.len());
+    for (group_id, group) in plan.mask_groups.iter().enumerate() {
+        let used = plan
+            .items
+            .iter()
+            .any(|item| item.mask_group == Some(group_id));
+        if !used {
+            masks.push(None);
+            continue;
+        }
+        let mut buffer = vec![0.0f32; width as usize * height as usize];
+        let mut source_count = 0usize;
+        for item in &plan.items {
+            if item.scope != group.owner_scope
+                || !group.sources.iter().any(|label| label == &item.label)
+            {
+                continue;
+            }
+            let Some(texture) = textures.get(&item.page) else {
+                continue;
+            };
+            source_count += 1;
+            for triangle in item.indices.chunks_exact(3) {
+                let (Some(v0), Some(v1), Some(v2)) = (
+                    item.vertices.get(triangle[0] as usize),
+                    item.vertices.get(triangle[1] as usize),
+                    item.vertices.get(triangle[2] as usize),
+                ) else {
+                    continue;
+                };
+                rasterize_triangle_coverage(&mut buffer, width, height, texture, v0, v1, v2, view);
+            }
+        }
+        stats.mask_sources += source_count;
+        masks.push(Some(buffer));
+    }
+
     for item in &plan.items {
         stats.items += 1;
         if (item.blend_mode & 0xF0) != 0x10 {
             stats.unsupported_blend += 1;
         }
-        if item.mask != 0 || item.stencil_type != 0 {
+        if item.mask != 0 || item.stencil_type != 0 || item.mask_group.is_some() {
             stats.masked_items += 1;
         }
         let Some(texture) = textures.get(&item.page) else {
             stats.missing_textures += 1;
             continue;
         };
+        let mask = item
+            .mask_group
+            .and_then(|group| masks.get(group))
+            .and_then(|mask| mask.as_deref());
         for triangle in item.indices.chunks_exact(3) {
             let (Some(v0), Some(v1), Some(v2)) = (
                 item.vertices.get(triangle[0] as usize),
@@ -351,7 +410,7 @@ fn render_with_textures(
             };
             stats.triangles += 1;
             stats.covered +=
-                rasterize_triangle(&mut rgba8, width, height, texture, v0, v1, v2, view);
+                rasterize_triangle(&mut rgba8, width, height, texture, v0, v1, v2, view, mask);
         }
     }
     Ok((
@@ -362,6 +421,60 @@ fn render_with_textures(
         },
         stats,
     ))
+}
+
+/// Rasterize one triangle into an alpha-coverage buffer.
+///
+/// Coverage is the union (max) of texture alpha times vertex alpha, matching
+/// the native mask pass where overlapping source sprites increment the same
+/// stencil reference only once.
+#[allow(clippy::too_many_arguments)]
+fn rasterize_triangle_coverage(
+    target: &mut [f32],
+    width: u32,
+    height: u32,
+    texture: &DecodedTexture,
+    v0: &PlanVertex,
+    v1: &PlanVertex,
+    v2: &PlanVertex,
+    view: ViewTransform,
+) -> usize {
+    let p0 = view.apply(v0.position);
+    let p1 = view.apply(v1.position);
+    let p2 = view.apply(v2.position);
+    let min_x = p0[0].min(p1[0]).min(p2[0]).floor().max(0.0) as i64;
+    let max_x = p0[0].max(p1[0]).max(p2[0]).ceil().min(width as f32 - 1.0) as i64;
+    let min_y = p0[1].min(p1[1]).min(p2[1]).floor().max(0.0) as i64;
+    let max_y = p0[1].max(p1[1]).max(p2[1]).ceil().min(height as f32 - 1.0) as i64;
+    if max_x < min_x || max_y < min_y {
+        return 0;
+    }
+    let area = edge(p0, p1, p2);
+    if area.abs() < 1e-9 {
+        return 0;
+    }
+    let mut covered = 0;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let point = [x as f32 + 0.5, y as f32 + 0.5];
+            let w0 = edge(p1, p2, point) / area;
+            let w1 = edge(p2, p0, point) / area;
+            let w2 = edge(p0, p1, point) / area;
+            if w0 < -1e-6 || w1 < -1e-6 || w2 < -1e-6 {
+                continue;
+            }
+            let uv = [
+                v0.uv[0] * w0 + v1.uv[0] * w1 + v2.uv[0] * w2,
+                v0.uv[1] * w0 + v1.uv[1] * w1 + v2.uv[1] * w2,
+            ];
+            let alpha = (v0.color[3] * w0 + v1.color[3] * w1 + v2.color[3] * w2)
+                * sample_bilinear(texture, uv)[3];
+            let index = y as usize * width as usize + x as usize;
+            target[index] = target[index].max(alpha.clamp(0.0, 1.0));
+            covered += 1;
+        }
+    }
+    covered
 }
 
 #[cfg(test)]

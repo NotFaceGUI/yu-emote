@@ -446,8 +446,13 @@ pub struct Motion {
     pub bounds: Bounds,
     /// Layer label to index map (`layerIndexMap`).
     pub layer_index_map: BTreeMap<String, i64>,
-    /// Draw-order frames (`priority`).
+    /// `priority` frames (draw-order emission).
     pub priority: Vec<PriorityFrame>,
+    /// Motion-local `parameter` table referenced by `parameterize` indices.
+    pub parameters: Vec<ParameterDef>,
+    /// Motion-level `parameterize` (index into this motion's parameter table):
+    /// the referenced motion's timeline is driven by that variable.
+    pub parameterize: Option<i64>,
     /// Root layers.
     pub layers: Vec<Layer>,
 }
@@ -525,6 +530,9 @@ pub struct Layer {
     pub motion_independent_layer_inherit: Option<i64>,
     /// `stencilType`.
     pub stencil_type: Option<i64>,
+    /// `stencilCompositeMaskLayerList`: labels resolved inside this motion
+    /// scope for a type-12 owner with `stencilType & 4`.
+    pub stencil_composite_mask_layer_list: Vec<String>,
     /// `objTriPriority`.
     pub obj_tri_priority: Option<i64>,
     /// `transformOrder`: permutation of flip/rotation/scale/shear stages.
@@ -997,6 +1005,11 @@ fn motion(value: &PsbValue) -> Motion {
         },
         layer_index_map,
         priority,
+        parameters: list_or_empty(get(map, "parameter"))
+            .iter()
+            .map(parameter_def)
+            .collect(),
+        parameterize: get_i64(map, "parameterize"),
         layers: layers(get(map, "layer")),
     }
 }
@@ -1032,6 +1045,14 @@ fn layer(value: &PsbValue) -> Layer {
         parameterize: get(map, "parameterize").and_then(parameter_ref),
         motion_independent_layer_inherit: get_i64(map, "motionIndependentLayerInherit"),
         stencil_type: get_i64(map, "stencilType"),
+        stencil_composite_mask_layer_list: if get_i64(map, "type") == Some(12) {
+            get(map, "stencilCompositeMaskLayerList")
+                .and_then(as_list)
+                .map(|items| items.iter().filter_map(as_str).map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         obj_tri_priority: get_i64(map, "objTriPriority"),
         transform_order: get(map, "transformOrder")
             .and_then(as_list)
