@@ -471,10 +471,11 @@ impl Motion {
         let Some(content) = frame.and_then(|frame| frame.content.as_ref()) else {
             return BTreeMap::new();
         };
+        let total = content.len() as i64;
         content
             .iter()
             .enumerate()
-            .map(|(position, index)| (*index, position as i64))
+            .map(|(position, index)| (*index, total - 1 - position as i64))
             .collect()
     }
 }

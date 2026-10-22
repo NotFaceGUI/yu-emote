@@ -644,7 +644,7 @@ impl Pose {
         }
         let mut out = Vec::new();
         walk(&self.layers, &mut out);
-        out.sort_by(|a, b| b.priority_path.cmp(&a.priority_path));
+        out.sort_by(|a, b| a.priority_path.cmp(&b.priority_path));
         out
     }
 }
