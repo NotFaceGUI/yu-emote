@@ -1,57 +1,49 @@
 yu-emote
 Copyright (c) 2026 NotFaceGUI
 
-This product includes software developed by third parties:
+This product includes software developed by third parties.
 
-1. emote-psb (https://github.com/storycraft/emote-psb-rs)
-   Copyright (c) storycraft
-   Licensed under the MIT License.
-   Used as the PSB/MDF binary parser dependency.
+1. eluna / eluna_rs (https://github.com/xmoezzz/eluna)
+   Commit 9a000293968392daa34c83f82b991f7ba25ccc29.
+   Licensed under the Mozilla Public License 2.0 (MPL-2.0).
 
-2. amadeus-emote-loader (https://github.com/Mieluoxxx/amadeus-emote-loader)
-   Licensed under the Apache License, Version 2.0.
-   Referenced for model normalization, part-table semantics and the wasm byte
-   ABI. No source code is copied in this milestone; if code is adopted later,
-   the adopted files will carry an Apache-2.0 header and this NOTICE will be
-   updated.
+   The complete `eluna_rs` crate source is vendored in `vendor/eluna/`,
+   together with its LICENSE and PROVENANCE.md. It is the animation runtime of
+   this project: PSB parsing, decryption, motion/timeline evaluation, mesh
+   chains, anchors, clips, joins, physics, controls and player state.
 
-Reference-only facts (no code copied):
+   Local modification (documented in vendor/eluna/PROVENANCE.md):
+   `src/psb/mod.rs::read_uint_array` accepts the bare 0x0c integer-array prefix
+   used by PSB v4 (`spec: ems`) models for empty arrays.
 
-0a. PSB body stream cipher (6-word state) and single-DWORD key search are
-    documented by FreeMote (CC BY-NC-SA 4.0) and eluna (MPL-2.0 crate
-    metadata). The implementation in src/psb.rs is independent.
+   MPL-2.0 text: https://www.mozilla.org/en-US/MPL/2.0/
 
-3. eluna (https://github.com/xmoezzz/eluna), commit
-   9a000293968392daa34c83f82b991f7ba25ccc29
-   The `eluna_rs` crate declares MPL-2.0; the preview player declares
-   MIT OR Apache-2.0. This project uses eluna as its primary behavioral
-   reference for timeline command streams, frame interpolation/easing,
-   inheritance and mesh chains, composite stencils, clamp/eye/mouth
-   controllers, physics and the type-7/anchor passes. The Rust modules
-   `src/anim.rs`, `src/pose.rs`, `src/physics.rs`, `src/control.rs`,
-   `src/player.rs`, `src/schema.rs`, `src/plan.rs` and `src/soft.rs`
-   contain algorithms adapted from eluna's recovered-native descriptions
-   and are therefore made available under MPL-2.0 as well. Their source is
-   this repository; the surrounding project remains MIT OR Apache-2.0.
-   The MPL-2.0 text is available at
-   https://www.mozilla.org/en-US/MPL/2.0/.
+2. eluna_player (https://github.com/xmoezzz/eluna, crates/eluna_player)
+   Licensed under MIT OR Apache-2.0 by the eluna contributors.
 
-4. FreeMote and the FreeMote WebGL runtime
-   (https://github.com/UlyssesWu/FreeMote) — CC BY-NC-SA 4.0; used only as an
-   oracle/reference. No code is incorporated.
+   The reference player supplied the vertex construction, texture-stage,
+   blend-table and rasterization math adapted in `src/plan.rs`, `src/soft.rs`
+   and `src/texture.rs`. Those files remain available under MIT OR Apache-2.0
+   with this attribution.
+
+3. FreeMote and the FreeMote WebGL runtime
+   (https://github.com/UlyssesWu/FreeMote), CC BY-NC-SA 4.0.
+   Used only as a format reference and visual oracle. No code is incorporated.
+
+4. Chocola-X/NekoWebShow (https://github.com/Chocola-X/NekoWebShow), AGPL-3.0,
+   and reAAAq/KrKr2-Next (https://github.com/reAAAq/KrKr2-Next), GPL-3.0.
+   Inspected as behavioral references only. No code is copied or linked.
 
 Facts about the official binaries (function addresses, shader variant counts,
-texture bit layout, key-string location) were obtained by inspecting the
-shipped SDK 0.495 `YSEmote.dll`/`emotedriver.dll` for interoperability. No
-official code or shader source was copied; the WGSL in `src/render.rs` is an
-independent description of the observed program semantics; the WGSL files
-under `shaders/` are generated from the feature table in `src/render.rs`.
+texture bit layout, key-string location, stdcall ABI) were obtained by
+inspecting the shipped SDK 0.495 `YSEmote.dll`/`emotedriver.dll` for
+interoperability. No official code or shader source was copied.
 
-Game assets used for local verification (the YU-RIS `emote_test.psb` and the
-Nekopara `*.pure.psb` files mirrored by Chocola-X/NekoWebShow) remain the
-property of their respective rights holders. They are not included in this
-repository, its packages, or its generated demo HTML; only the renderer and the
-demo generator are distributed.
+Game assets used for local verification (the YU-RIS sample and the Nekopara
+`*.pure.psb` files mirrored by Chocola-X/NekoWebShow) remain the property of
+their respective rights holders. They are not included in this repository, its
+packages, or its generated demo HTML; only the runtime, renderer and demo
+generator are distributed.
 
 E-mote is a product of M2 Co., Ltd. This project is not affiliated with,
 endorsed by, or sponsored by M2. Nekopara is a product of NEKO WORKs; this

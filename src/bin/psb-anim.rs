@@ -2,265 +2,223 @@
 //!
 //! ```text
 //! psb-anim <model.psb> --timeline NAME --out-dir DIR [--fps 15] [--seconds 7]
-//!          [--key HEX] [--object NAME] [--motion NAME] [--view SCALE,X,Y]
-//!          [--var NAME=VALUE]... [--settle TICKS] [--margin 20]
+//!          [--key HEX] [--motion NAME] [--view SCALE,X,Y] [--canvas WxH]
+//!          [--var NAME=VALUE]... [--settle TICKS] [--settle-loops N]
+//!          [--margin PX] [--no-loop] [--no-physics]
 //! ```
 //!
-//! One player is advanced across the whole clip, so this is O(frames) rather
-//! than re-simulating from zero for every image. The first frame also fixes
-//! the camera unless `--view` is supplied.
+//! For an authored loop the clip starts at `loopBegin`; `--settle-loops N`
+//! advances N complete loops before recording so physics/controller transients
+//! do not appear as a seam when the video repeats.
+//!
+//! The player advances in native 60 Hz ticks and renders one output frame per
+//! `60 / fps` ticks, so physics and timeline easing are evaluated at engine
+//! rate regardless of the output frame rate. The first frame fixes the view
+//! unless `--view` is supplied.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use serde_json::json;
-use yu_emote::plan::RenderPlan;
-use yu_emote::player::Player;
-use yu_emote::psb;
-use yu_emote::schema::Model;
-use yu_emote::soft;
+use yu_emote::{EMOTE_TICKS_PER_SECOND, Emote, TimelinePlayMode, soft};
 
 fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         eprintln!(
-            "usage: psb-anim <model.psb> --timeline NAME --out-dir DIR [--key HEX] \
-             [--object NAME] [--motion NAME] [--fps N] [--seconds T] [--view SCALE,X,Y] \
-             [--var NAME=VALUE]... [--settle TICKS]"
+            "usage: psb-anim <model.psb> --timeline NAME --out-dir DIR [--fps N] \
+             [--seconds T] [--key HEX] [--motion NAME] [--view SCALE,X,Y] \
+             [--canvas WxH] [--var NAME=VALUE]... [--settle TICKS] \
+             [--settle-loops N] [--margin PX] [--no-loop] [--no-physics]"
         );
-        return ExitCode::FAILURE;
+        return Ok(());
     };
+
     let mut key = None;
-    let mut object = None;
     let mut motion = None;
     let mut timeline = None;
     let mut out_dir: Option<PathBuf> = None;
-    let mut fps = 15.0f64;
-    let mut seconds = 7.0f64;
+    let mut fps = 15.0f32;
+    let mut seconds = 7.0f32;
+    let mut settle_ticks = 0u32;
+    let mut settle_loops = 0u32;
+    let mut looping = true;
+    let mut physics = true;
     let mut variables = BTreeMap::new();
     let mut fixed_view: Option<soft::ViewTransform> = None;
-    let mut settle = 0usize;
+    let mut canvas = [900u32, 1400u32];
     let mut margin = 20.0f32;
-    let mut loop_timeline = true;
-    let mut controls_enabled = true;
-    let mut physics_enabled = true;
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--key" => match args.next().as_deref().map(parse_key) {
-                Some(Ok(value)) => key = Some(value),
-                _ => {
-                    eprintln!("--key needs a decimal or 0x-prefixed u32");
-                    return ExitCode::FAILURE;
+            "--key" => key = Some(parse_key(&need(&mut args, "--key")?)?),
+            "--motion" => motion = Some(need(&mut args, "--motion")?),
+            "--timeline" => timeline = Some(need(&mut args, "--timeline")?),
+            "--out-dir" => out_dir = Some(PathBuf::from(need(&mut args, "--out-dir")?)),
+            "--fps" => {
+                let value = parse_num(&need(&mut args, "--fps")?)?;
+                if value <= 0.0 {
+                    return Err("--fps needs a positive number".into());
                 }
-            },
-            "--object" => object = args.next(),
-            "--motion" => motion = args.next(),
-            "--timeline" => timeline = args.next(),
-            "--out-dir" => out_dir = args.next().map(PathBuf::from),
-            "--fps" => match args.next().map(|value| value.parse::<f64>()) {
-                Some(Ok(value)) if value > 0.0 => fps = value,
-                _ => {
-                    eprintln!("--fps needs a positive number");
-                    return ExitCode::FAILURE;
-                }
-            },
-            "--seconds" => match args.next().map(|value| value.parse::<f64>()) {
-                Some(Ok(value)) if value >= 0.0 => seconds = value,
-                _ => {
-                    eprintln!("--seconds needs a non-negative number");
-                    return ExitCode::FAILURE;
-                }
-            },
-            "--margin" => match args.next().map(|value| value.parse::<f32>()) {
-                Some(Ok(value)) => margin = value,
-                _ => {
-                    eprintln!("--margin needs a number");
-                    return ExitCode::FAILURE;
-                }
-            },
-            "--no-loop" => loop_timeline = false,
-            "--no-controls" => controls_enabled = false,
-            "--no-physics" => physics_enabled = false,
-            "--settle" => match args.next().map(|value| value.parse::<usize>()) {
-                Some(Ok(value)) => settle = value,
-                _ => {
-                    eprintln!("--settle needs a non-negative integer");
-                    return ExitCode::FAILURE;
-                }
-            },
+                fps = value;
+            }
+            "--seconds" => seconds = parse_num(&need(&mut args, "--seconds")?)?,
+            "--settle" => settle_ticks = parse_num::<u32>(&need(&mut args, "--settle")?)?,
+            "--settle-loops" => {
+                settle_loops = parse_num::<u32>(&need(&mut args, "--settle-loops")?)?
+            }
+            "--no-loop" => looping = false,
+            "--no-physics" => physics = false,
+            "--no-controls" => {
+                // Controllers are part of the runtime; accepted for CLI
+                // compatibility with the previous tool.
+            }
             "--var" => {
-                let Some(spec) = args.next() else {
-                    eprintln!("--var needs NAME=VALUE");
-                    return ExitCode::FAILURE;
-                };
-                let Some((name, value)) = spec.split_once('=') else {
-                    eprintln!("invalid --var `{spec}`");
-                    return ExitCode::FAILURE;
-                };
-                match value.parse::<f64>() {
-                    Ok(value) => {
-                        variables.insert(name.to_string(), value);
-                    }
-                    Err(error) => {
-                        eprintln!("invalid --var value `{value}`: {error}");
-                        return ExitCode::FAILURE;
-                    }
-                }
+                let spec = need(&mut args, "--var")?;
+                let (name, value) = spec
+                    .split_once('=')
+                    .ok_or_else(|| format!("invalid --var `{spec}` (expected NAME=VALUE)"))?;
+                variables.insert(name.to_owned(), parse_num::<f32>(value)? as f64);
             }
             "--view" => {
-                let Some(value) = args.next() else {
-                    eprintln!("--view needs SCALE,X,Y");
-                    return ExitCode::FAILURE;
-                };
+                let value = need(&mut args, "--view")?;
                 let parts: Vec<_> = value.split(',').collect();
                 if parts.len() != 3 {
-                    eprintln!("--view needs SCALE,X,Y");
-                    return ExitCode::FAILURE;
+                    return Err(format!("--view needs SCALE,X,Y, got `{value}`").into());
                 }
-                match (
-                    parts[0].parse::<f32>(),
-                    parts[1].parse::<f32>(),
-                    parts[2].parse::<f32>(),
-                ) {
-                    (Ok(scale), Ok(x), Ok(y)) => {
-                        fixed_view = Some(soft::ViewTransform {
-                            scale,
-                            offset: [x, y],
-                        })
-                    }
-                    _ => {
-                        eprintln!("--view needs numeric SCALE,X,Y");
-                        return ExitCode::FAILURE;
-                    }
-                }
+                fixed_view = Some(soft::ViewTransform {
+                    scale: parse_num(parts[0])?,
+                    offset: [parse_num(parts[1])?, parse_num(parts[2])?],
+                });
             }
-            other => {
-                eprintln!("unknown argument `{other}`");
-                return ExitCode::FAILURE;
+            "--canvas" => {
+                let value = need(&mut args, "--canvas")?;
+                let (w, h) = value
+                    .split_once(['x', 'X', ','])
+                    .ok_or_else(|| format!("--canvas needs WxH, got `{value}`"))?;
+                canvas = [parse_num::<u32>(w)?.max(1), parse_num::<u32>(h)?.max(1)];
+            }
+            "--margin" => margin = parse_num(&need(&mut args, "--margin")?)?,
+            other => return Err(format!("unknown argument `{other}`").into()),
+        }
+    }
+
+    let timeline = timeline.ok_or("--timeline is required")?;
+    let out_dir = out_dir.ok_or("--out-dir is required")?;
+    fs::create_dir_all(&out_dir)?;
+
+    let mut emote = Emote::load(&path, key, motion.as_deref())?;
+    emote.set_variables(&variables)?;
+    if !physics {
+        emote.runtime.set_physics_enabled(false);
+    }
+    let mode = if looping {
+        TimelinePlayMode::LOOP
+    } else {
+        TimelinePlayMode::ONCE
+    };
+    emote.play_timeline(&timeline, mode)?;
+    // An authored loop may have an intro before `loopBegin`. Start the clip at
+    // the steady-state boundary so the encoded video loops without a seam.
+    let loop_bounds = if looping {
+        let begin = emote.runtime.timeline_loop_begin(&timeline);
+        let end = emote.runtime.timeline_loop_end(&timeline);
+        if let Some(begin) = begin {
+            emote.runtime.set_timeline_time(&timeline, begin)?;
+        }
+        begin.zip(end)
+    } else {
+        None
+    };
+
+    // Let one-shot physics/controller transients settle before recording. A
+    // cold-start first loop does not have the same state as the steady-state
+    // loop, which would show up as a jump when the video repeats.
+    if let Some((begin, end)) = loop_bounds {
+        let loop_ticks = (end - begin).max(0.0);
+        for _ in 0..settle_loops {
+            let mut remaining = loop_ticks;
+            while remaining > 0.0 {
+                let step = remaining.min(1.0);
+                emote.advance_ticks(step)?;
+                remaining -= step;
             }
         }
     }
-    let Some(timeline) = timeline else {
-        eprintln!("--timeline is required");
-        return ExitCode::FAILURE;
-    };
-    let Some(out_dir) = out_dir else {
-        eprintln!("--out-dir is required");
-        return ExitCode::FAILURE;
-    };
-
-    let document = match psb::read_document_with_key(&path, key) {
-        Ok(document) => document,
-        Err(error) => {
-            eprintln!("{path}: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let model = Model::from_document(&document);
-    let object = object
-        .or_else(|| model.metadata.character.clone())
-        .or_else(|| model.objects.keys().next().cloned())
-        .unwrap_or_default();
-    let motion = motion
-        .or_else(|| model.metadata.base_motion.clone())
-        .or_else(|| {
-            model
-                .objects
-                .get(&object)
-                .and_then(|object| object.motions.keys().next().cloned())
-        })
-        .unwrap_or_default();
-
-    let mut player = Player::new(&model, &object, &motion, 60.0);
-    player.controls_enabled = controls_enabled;
-    player.physics_enabled = physics_enabled;
-    for (name, value) in &variables {
-        player.set_variable(name.clone(), *value);
-    }
-    if settle > 0 {
-        player.settle(&model, settle);
-    }
-    if let Err(error) = player.play(&timeline, loop_timeline) {
-        eprintln!("timeline `{timeline}`: {error}");
-        return ExitCode::FAILURE;
+    for _ in 0..settle_ticks {
+        emote.advance_ticks(1.0)?;
     }
 
-    let frame_count = (seconds * fps).round().max(1.0) as usize;
-    if let Err(error) = fs::create_dir_all(&out_dir) {
-        eprintln!("{}: {error}", out_dir.display());
-        return ExitCode::FAILURE;
-    }
-
-    let mut textures: Option<BTreeMap<String, yu_emote::texture::DecodedTexture>> = None;
+    let frames = (seconds * fps).round().max(1.0) as usize;
+    let ticks_per_frame = EMOTE_TICKS_PER_SECOND / fps;
+    let mut tick_carry = 0.0f32;
+    let mut textures = None;
     let mut view = fixed_view;
-    let mut written = Vec::with_capacity(frame_count);
-    let dt = 1.0 / fps;
-    for index in 0..frame_count {
-        if index > 0 {
-            player.tick(&model, dt);
+    let mut written = 0usize;
+
+    for frame in 0..frames {
+        tick_carry += ticks_per_frame;
+        while tick_carry >= 1.0 {
+            emote.advance_ticks(1.0)?;
+            tick_carry -= 1.0;
         }
-        player.overlay_variables(&variables);
-        let Some(pose) = player.pose(&model) else {
-            eprintln!("no pose for `{object}/{motion}`");
-            return ExitCode::FAILURE;
-        };
-        let plan = RenderPlan::build(&model, &pose);
-        if textures.is_none() {
-            textures = match soft::decode_textures(&document, &model, &plan) {
-                Ok(textures) => Some(textures),
-                Err(error) => {
-                    eprintln!("textures: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-        }
-        if view.is_none() {
-            view = Some(soft::ViewTransform::fit(&plan, margin));
-        }
-        let Some(view_transform) = view else {
-            unreachable!();
-        };
-        let Some(textures) = textures.as_ref() else {
-            unreachable!();
-        };
-        let (image, _stats) = match soft::render_with_textures(&plan, textures, view_transform) {
-            Ok(rendered) => rendered,
-            Err(error) => {
-                eprintln!("render: {error}");
-                return ExitCode::FAILURE;
+
+        let plan = emote.plan(canvas);
+        let frame_view = match view {
+            Some(view) => view,
+            None => {
+                let fitted = soft::ViewTransform::fit(&plan, margin);
+                view = Some(fitted);
+                fitted
             }
         };
-        let frame_path = out_dir.join(format!("frame-{index:04}.png"));
-        if let Err(error) = write_png(&frame_path, &image) {
-            eprintln!("{}: {error}", frame_path.display());
-            return ExitCode::FAILURE;
+        if textures.is_none() {
+            textures = Some(emote.textures()?);
         }
-        written.push(frame_path.to_string_lossy().to_string());
+        let textures = textures.as_ref().expect("textures were just decoded");
+        let (image, _stats) = soft::render_with_textures(&plan, textures, frame_view)?;
+        let file = out_dir.join(format!("frame-{frame:04}.png"));
+        write_png(&file, &image)?;
+        written += 1;
     }
 
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "object": object,
-            "motion": motion,
             "timeline": timeline,
+            "frames": written,
             "fps": fps,
-            "seconds": seconds,
-            "frames": written.len(),
-            "view": view,
-            "first": written.first(),
-            "last": written.last(),
-        }))
-        .unwrap_or_default()
+            "canvas": canvas,
+            "view": view.map(|view| json!({
+                "scale": view.scale,
+                "offset": view.offset,
+            })),
+            "playing": emote.runtime.is_timeline_playing(&timeline),
+            "loop": emote.runtime.is_loop_timeline(&timeline),
+            "loop_begin": emote.runtime.timeline_loop_begin(&timeline),
+            "loop_end": emote.runtime.timeline_loop_end(&timeline),
+            "out_dir": out_dir,
+        }))?
     );
-    ExitCode::SUCCESS
+    Ok(())
 }
 
 fn write_png(path: &Path, image: &soft::RenderImage) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::create(path)?;
-    let mut encoder = png::Encoder::new(file, image.width, image.height);
+    let mut encoder = png::Encoder::new(BufWriter::new(file), image.width, image.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header()?;
@@ -268,14 +226,27 @@ fn write_png(path: &Path, image: &soft::RenderImage) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn parse_key(value: &str) -> Result<u32, ()> {
-    let value = value.trim();
-    if let Some(hex) = value
+fn need(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
+    args.next()
+        .ok_or_else(|| format!("{option} needs a value"))
+}
+
+fn parse_key(raw: &str) -> Result<u32, String> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed
         .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
+        .or_else(|| trimmed.strip_prefix("0X"))
     {
-        u32::from_str_radix(hex, 16).map_err(|_| ())
+        u32::from_str_radix(hex, 16).map_err(|_| format!("invalid key `{raw}`"))
     } else {
-        value.parse().map_err(|_| ())
+        trimmed
+            .parse::<u32>()
+            .map_err(|_| format!("invalid key `{raw}`"))
     }
+}
+
+fn parse_num<T: std::str::FromStr>(raw: &str) -> Result<T, String> {
+    raw.trim()
+        .parse::<T>()
+        .map_err(|_| format!("invalid number `{raw}`"))
 }

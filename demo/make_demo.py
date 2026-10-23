@@ -8,7 +8,7 @@ script writes:
     target/emote-demo/index.html   single-file page (frames embedded as PNG)
     target/emote-demo/frames/*.png intermediate frames
 
-All pixels come from the clean-room renderer in this repository.
+Pixels come from the vendored eluna runtime and the yu-emote software renderer.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ from pathlib import Path
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
-RENDER = ROOT / "target" / "debug" / ("psb-render.exe" if sys.platform == "win32" else "psb-render")
-ANIM = ROOT / "target" / "debug" / ("psb-anim.exe" if sys.platform == "win32" else "psb-anim")
+BIN_DIR = ROOT / "target" / ("release" if (ROOT / "target" / "release").exists() else "debug")
+RENDER = BIN_DIR / ("psb-render.exe" if sys.platform == "win32" else "psb-render")
+ANIM = BIN_DIR / ("psb-anim.exe" if sys.platform == "win32" else "psb-anim")
 OUT = ROOT / "target" / "emote-demo"
 
 POSES = [
@@ -187,6 +188,8 @@ def main() -> int:
                     "30",
                     "--seconds",
                     "7.0",
+                    "--settle-loops",
+                    "1",
                     *fixed,
                 ],
                 anim_dir,
@@ -195,11 +198,12 @@ def main() -> int:
         else:
             anim_frames = anim_frames[:expected_frames]
 
-        # A short one-shot gesture (挨拶) proves timeline transitions beyond
-        # the subtle idle loop. It is cached separately from the idle clip.
+        # A short one-shot gesture (にっこり) proves timeline transitions
+        # beyond the subtle idle loop. It is cached separately from the idle
+        # clip.
         gesture_dir = OUT / "frames" / f"{stem}-gesture"
         gesture_webm = OUT / "frames" / f"{stem}-gesture.webm"
-        gesture_count = 45
+        gesture_count = 60
         gesture_frames = sorted(gesture_dir.glob("frame-*.png")) if gesture_dir.exists() else []
         if args.force or len(gesture_frames) < gesture_count:
             run_anim(
@@ -207,11 +211,11 @@ def main() -> int:
                 args.key,
                 [
                     "--timeline",
-                    "挨拶",
+                    "にっこり",
                     "--fps",
                     "30",
                     "--seconds",
-                    "1.5",
+                    "2.0",
                     "--no-loop",
                     *fixed,
                 ],
@@ -394,9 +398,9 @@ def main() -> int:
           <span>canvas</span><b id="st-tex">—</b>
         </div>
         <div class="note">
-          実ゲームの <code>.psb</code> を、公開実装（eluna / FreeMote など）を
-          参考にしたこのリポジトリの Rust 実装（PSB → VAR/pose → draw list →
-          CPU raster）で描画しています。
+          実ゲームの <code>.psb</code> を、vendored <code>eluna</code> ランタイム
+          （モーション／タイムライン／メッシュ／物理）と、このリポジトリの
+          draw list + CPU ラスタライザで描画しています。
           <kbd>←</kbd><kbd>→</kbd> 表情、<kbd>↑</kbd><kbd>↓</kbd> キャラクター。
         </div>
       </div>
@@ -404,7 +408,7 @@ def main() -> int:
   </div>
 
   <footer>
-    <span>models: {len(models)} · poses: {len(POSES)} · rendered at 800×1080</span>
+    <span>models: {len(models)} · poses: {len(POSES)} · rendered at 900×1400</span>
     <span>assets stay local; not redistributed</span>
   </footer>
 </div>
@@ -446,7 +450,7 @@ liveButton.addEventListener('click', () => startLive());
 posesEl.appendChild(liveButton);
 
 const gestureButton = document.createElement('button');
-gestureButton.textContent = '▶ しぐさ（挨拶）';
+gestureButton.textContent = '▶ しぐさ（にっこり）';
 gestureButton.style.setProperty('--pill', '#d7a35a');
 gestureButton.addEventListener('click', () => startClip('gesture'));
 posesEl.appendChild(gestureButton);
@@ -457,7 +461,8 @@ function updateStats(model) {{
   document.getElementById('st-items').textContent = stats.items;
   document.getElementById('st-tris').textContent = stats.triangles.toLocaleString();
   document.getElementById('st-mask').textContent = stats.mask_sources;
-  document.getElementById('st-tex').textContent = model.stats.width + '×' + model.stats.height;
+  const canvas = model.stats.canvas || [model.stats.image?.width, model.stats.image?.height];
+  document.getElementById('st-tex').textContent = canvas.join('×');
 }}
 
 function setImage(src, label, vars) {{
@@ -516,9 +521,9 @@ function startClip(kind) {{
   animEl.play().catch(() => {{
     animEl.addEventListener('canplay', () => animEl.play().catch(() => {{}}), {{ once: true }});
   }});
-  nameEl.textContent = model.label + (kind === 'gesture' ? ' · 挨拶' : ' · 待機ループ');
+  nameEl.textContent = model.label + (kind === 'gesture' ? ' · にっこり' : ' · 待機ループ');
   varsEl.textContent = kind === 'gesture'
-    ? 'timeline: 挨拶 · one-shot'
+    ? 'timeline: にっこり · one-shot'
     : 'timeline: 待機ループ00 · 60Hz engine / 30fps preview';
   updateStats(model);
 }}

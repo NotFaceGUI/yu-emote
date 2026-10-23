@@ -1,79 +1,67 @@
 //! # yu-emote
 //!
-//! E-mote (EMT/PSB) data layer and YU-RIS adapter.
-//!
-//! The runtime behavior is referenced from the open-source `eluna` project
-//! (MPL-2.0); see `NOTICE` and `README.md`.
+//! E-mote (EMT/PSB) runtime and YU-RIS adapter.
 //!
 //! E-mote is a 2D character-animation middleware by M2 Co., Ltd. YU-RIS games
 //! load E-mote models through an optional plugin (`YSEmote.dll` →
-//! `emotedriver.dll`). This crate is an independent Rust implementation of the
-//! **data and scheduling layers**, designed to be usable natively and on
-//! `wasm32`:
+//! `emotedriver.dll`). This crate provides the YU-RIS-facing pieces:
 //!
-//! - [`psb`]: PSB/MDF container parsing (delegates the binary format to the
-//!   MIT-licensed `emote-psb` crate).
-//! - [`schema`]: typed model extraction (screen, atlas pages, objects,
-//!   motions, layers, variables, timelines, controllers).
-//! - [`texture`]: RGBA4444 atlas decoding (evidenced by the official DLL).
-//! - [`anim`]: deterministic variable/timeline state (M2).
-//! - [`pose`]: layer/frame evaluation and transform composition (M2).
-//! - [`plan`]: pose to textured mesh draw list (M3 geometry bridge).
-//! - [`soft`]: deterministic CPU rasterizer for validation and screenshots.
-//! - [`render`]: WGSL variants and Bezier mesh generation (M3).
-//! - [`model`]: deterministic, renderer-independent summary of an E-mote PSB
-//!   tree (version, top-level sections, node counts, resource counts).
-//! - [`yuris`]: YU-RIS glue — `EMOTE` parameter recording, `EMOTEINFO`
-//!   queries, capability reporting, suspension and dirty-frame tracking.
+//! - [`psb`]: PSB/MDF access, body decryption with an explicit per-game key
+//!   and embedded resource ranges;
+//! - [`runtime`]: load and drive an E-mote model;
+//! - [`texture`]: `RGBA4444` / 32-bpp / RL texture decoding;
+//! - [`plan`]: evaluated scene → textured triangle draw plan;
+//! - [`soft`]: deterministic CPU rasterizer used for screenshots and the demo;
+//! - [`yuris`]: YU-RIS `EMOTE` parameter recording, capability reporting,
+//!   suspension and dirty-frame tracking.
 //!
-//! Timeline playback, graph/physics controllers and a deterministic CPU
-//! rasterizer are implemented; the wgpu delivery pipeline is still pending.
-//! See `docs/ARCHITECTURE.md`.
+//! ## Runtime ownership
+//!
+//! The animation core is **not** implemented in this crate. PSB parsing,
+//! motion/timeline evaluation, mesh-chain deformation, anchors, clips, joins,
+//! physics and the SDK state machine come from the vendored
+//! [`eluna`](https://github.com/xmoezzz/eluna) runtime under `vendor/eluna`
+//! (MPL-2.0). This crate adapts that runtime to YU-RIS data and to rendering.
+//!
+//! Vendor provenance and the one local PSB v4 parsing fix are documented in
+//! `vendor/eluna/PROVENANCE.md`. See `NOTICE` and `README.md` for licensing.
 //!
 //! ## Example
 //!
 //! ```no_run
-//! use yu_emote::model::ModelSummary;
-//! use yu_emote::psb;
+//! use yu_emote::{Emote, soft};
 //!
-//! let document = psb::read_document("emote_test.psb")?;
-//! let summary = ModelSummary::from_document(&document);
-//! println!("{}", serde_json::to_string_pretty(&summary)?);
+//! let mut emote = Emote::load("model.psb", None, None)?;
+//! emote.play_timeline("idle", yu_emote::TimelinePlayMode::LOOP)?;
+//! emote.advance_ticks(1.0)?;
+//!
+//! let plan = emote.plan([900, 1400]);
+//! let textures = emote.textures()?;
+//! let view = soft::ViewTransform::fit(&plan, 24.0);
+//! let (image, _stats) = soft::render_with_textures(&plan, &textures, view)?;
+//! # let _ = image;
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-//!
-//! ## Licensing
-//!
-//! Dual-licensed under MIT OR Apache-2.0. The PSB/MDF binary parser is the
-//! MIT-licensed `emote-psb` crate; see `NOTICE` for attributions.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-pub mod anim;
-pub mod control;
 pub mod error;
-pub mod model;
-pub mod physics;
 pub mod plan;
-pub mod player;
-pub mod pose;
 pub mod psb;
-pub mod render;
-pub mod schema;
+pub mod runtime;
 pub mod soft;
 pub mod texture;
 pub mod yuris;
 
-pub use anim::Animator;
+pub use eluna;
 pub use error::EmoteError;
-pub use model::{ModelSummary, PsbNodeCounts};
-pub use plan::{DrawItem, RenderPlan};
-pub use player::Player;
-pub use pose::{FrameState, LayerPose, Pose};
-pub use psb::PsbDocument;
-pub use schema::Model;
-pub use soft::{RenderImage, SoftStats};
+pub use plan::{DrawItem, MaskGroup, PlanVertex, RenderPlan};
+pub use psb::{PsbDocument, PsbFile, PsbValue};
+pub use runtime::{
+    EMOTE_TICKS_PER_SECOND, ElunaPlayer, Emote, EmoteDrawPass, EmoteMeshPatch, EmoteStaticSprite,
+    EmoteTransformMode, TimelinePlayMode,
+};
 pub use texture::DecodedTexture;
 pub use yuris::{Capability, EmoteArg, YurisEmote};
 

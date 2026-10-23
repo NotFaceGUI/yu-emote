@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-description = "E-mote (PSB/EMT) data layer and YU-RIS adapter built with reference to eluna: parse, animate, render"
+description = "E-mote (PSB/EMT) runtime and YU-RIS adapter built on the vendored eluna runtime"
 repository = "https://github.com/NotFaceGUI/yu-emote"
 readme = "README.md"
 keywords = ["e-mote", "psb", "emt", "yu-ris", "wgpu"]
@@ -15,17 +15,31 @@ name = "yu_emote"
 path = "src/lib.rs"
 
 [dependencies]
-emote-psb = "0.8"
+eluna = { package = "eluna_rs", path = "vendor/eluna" }
+png = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
-png = "0.17"
-smol_str = "0.3.6"
 thiserror = "2"
 
 [[bin]]
 name = "psb-info"
 path = "src/bin/psb-info.rs"
+
+[[bin]]
+name = "psb-dump"
+path = "src/bin/psb-dump.rs"
+
+[[bin]]
+name = "psb-key-search"
+path = "src/bin/psb-key-search.rs"
+
+[[bin]]
+name = "psb-render"
+path = "src/bin/psb-render.rs"
+
+[[bin]]
+name = "psb-anim"
+path = "src/bin/psb-anim.rs"
 
 [profile.release]
 lto = "thin"

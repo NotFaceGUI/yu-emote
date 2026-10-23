@@ -1,30 +1,25 @@
-//! Render plan generation (M3 geometry bridge).
-//! Algorithms and native semantics adapted from eluna (MPL-2.0,
-//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
+//! Draw-plan generation from an evaluated `eluna` scene.
 //!
-//! Converts an evaluated [`Pose`] into textured mesh draw items that can be
-//! uploaded to wgpu (or a software rasterizer) without exposing E-mote mesh
-//! structures to `yu-gfx`.
+//! The scene itself (motion selection, timeline state, mesh-chain deformation,
+//! physics, anchors, clips, joins) is produced by the vendored `eluna` runtime.
+//! This module only turns its sprites into textured triangles, using the same
+//! vertex math as the reference `eluna_player` renderer:
 //!
-//! ## Evidence / open items
+//! - local rectangle -> center-relative scale -> rotation -> world transform;
+//! - 4x4 Bezier patch sampling for deformed meshes;
+//! - four corner colors in `0xRRGGBBAA` order, alpha multiplied by opacity;
+//! - native draw order (the scene already emits `DrawFrameInfo` order).
 //!
-//! - Atlas rectangles, pivots and page names come from official PSB data.
-//! - Mesh tessellation uses the 4x4 cubic Bezier patch in [`crate::render`]
-//!   (public-tooling behavior, pending official parity).
-//! - `src == "blank"` layers are mask/deformation proxies, not color draws;
-//!   they are skipped and counted.
-//! - Composite masks are resolved by [`crate::soft`] from the plan's
-//!   [`MaskGroup`] list; items carry `mask_group`, `stencil_type` and `mask`.
-//! - Vertex color channel order is `0xRRGGBBAA` (low byte alpha), evidenced by
-//!   the eyelid layer's opaque-black `0x000000FF`.
+//! Stencil/mask owners are resolved from eluna's structural
+//! `native_draw_key` chain. Inner masks are unioned into per-owner coverage
+//! buffers by [`crate::soft`]; outer masks are reported as skipped because the
+//! CPU rasterizer has no stencil reference pass yet.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::pose::{Affine2, LayerPose, MaskGroup, Pose};
-use crate::render::MeshGrid;
-use crate::schema::{AtlasIcon, IconRef, Model, TextureSource};
+use eluna::{EmoteDrawFrameInfo, EmoteDrawPass, EmoteMeshPatch, EmoteStaticScene, EmoteStaticSprite};
 
 /// One vertex in model/pixel space.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -52,80 +47,153 @@ pub struct DrawItem {
     pub page_width: u32,
     /// Page height in pixels.
     pub page_height: u32,
-    /// Blend mode (`bm`).
+    /// Blend mode (`bm`), including the MODULATE2X high nibble.
     pub blend_mode: u32,
+    /// Native draw pass.
+    #[serde(skip)]
+    pub pass: EmoteDrawPass,
     /// Whether the item uses a deformed mesh.
     pub mesh: bool,
-    /// Tessellation density.
+    /// Tessellation density (0 for a plain quad).
     pub mesh_division: u32,
     /// `stencilType` from the layer.
     pub stencil_type: i64,
     /// Type-7 clip rectangle in model space (`left, top, right, bottom`).
     pub clip_rect: Option<[f32; 4]>,
-    /// Composite-mask group inherited from a type-12 owner.
-    pub mask_group: Option<usize>,
-    /// Motion scope used to resolve `stencilCompositeMaskLayerList` labels.
-    pub scope: usize,
-    /// Layer mask bits.
-    pub mask: i64,
+    /// Inner stencil groups that must be satisfied before this item is drawn.
+    pub mask_groups: Vec<usize>,
+    /// Type-12 wipe parameters (`enabled`, `scale`, `bias`).
+    pub wipe: [f32; 3],
     /// Vertices.
     pub vertices: Vec<PlanVertex>,
     /// Triangle indices.
     pub indices: Vec<u32>,
 }
 
-/// Deterministic draw plan for one pose.
+/// Coverage sources for one inner stencil owner.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaskGroup {
+    /// Source item indices in [`RenderPlan::items`].
+    pub sources: Vec<usize>,
+    /// Structural owner key (diagnostics only).
+    pub owner: Vec<u64>,
+}
+
+/// Deterministic draw plan for one scene.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RenderPlan {
-    /// Model screen width.
+    /// Output canvas width.
     pub width: u32,
-    /// Model screen height.
+    /// Output canvas height.
     pub height: u32,
-    /// Draw items in traversal order.
+    /// Draw items in native emission order.
     pub items: Vec<DrawItem>,
-    /// Composite-mask owners reachable from this pose.
+    /// Inner stencil owners reachable from this scene.
     pub mask_groups: Vec<MaskGroup>,
-    /// Layers skipped, keyed by reason.
+    /// Sprites skipped, keyed by reason.
     pub skipped: BTreeMap<String, usize>,
 }
 
 impl RenderPlan {
-    /// Build a plan from a model and pose.
-    pub fn build(model: &Model, pose: &Pose) -> Self {
-        let width = model.screen.width.max(1.0) as u32;
-        let height = model.screen.height.max(1.0) as u32;
-        let mut items = Vec::new();
+    /// Build a plan from an evaluated `eluna` scene.
+    ///
+    /// `canvas` is the output size used by [`crate::soft::ViewTransform::fit`].
+    pub fn from_scene(scene: &EmoteStaticScene, canvas: [u32; 2]) -> Self {
         let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        let visible: Vec<&EmoteStaticSprite> = scene
+            .sprites
+            .iter()
+            .filter(|sprite| {
+                if !sprite.visible {
+                    *skipped.entry("invisible".to_owned()).or_default() += 1;
+                    return false;
+                }
+                if sprite.opacity <= 0.0 {
+                    *skipped.entry("zero-opacity".to_owned()).or_default() += 1;
+                    return false;
+                }
+                if sprite.width <= 0.0 || sprite.height <= 0.0 {
+                    *skipped.entry("zero-size".to_owned()).or_default() += 1;
+                    return false;
+                }
+                true
+            })
+            .collect();
 
-        for layer in pose.drawables() {
-            match build_item(model, layer) {
-                Ok(Some(item)) => items.push(item),
-                Ok(None) => {}
-                Err(reason) => *skipped.entry(reason.to_string()).or_default() += 1,
+        let mut items: Vec<DrawItem> = visible.iter().map(|sprite| build_item(sprite)).collect();
+
+        let mut key_to_item = BTreeMap::<Vec<u64>, usize>::new();
+        for (index, sprite) in visible.iter().enumerate() {
+            key_to_item.insert(sprite.draw_frame_info.native_draw_key.clone(), index);
+        }
+        let layer_infos: BTreeMap<Vec<u64>, &EmoteDrawFrameInfo> = scene
+            .layer_states
+            .iter()
+            .map(|state| {
+                (
+                    state.draw_frame_info.native_draw_key.clone(),
+                    &state.draw_frame_info,
+                )
+            })
+            .collect();
+
+        let mut mask_groups: Vec<MaskGroup> = Vec::new();
+        let mut group_by_owner = BTreeMap::<Vec<u64>, usize>::new();
+        for (index, sprite) in visible.iter().enumerate() {
+            if matches!(
+                sprite.draw_frame_info.pass,
+                EmoteDrawPass::MaskGeneration | EmoteDrawPass::StencilCompositeMask
+            ) {
+                *skipped.entry("stencil-source".to_owned()).or_default() += 1;
+                continue;
+            }
+            let mut cursor = sprite.draw_frame_info.stencil_parent_native_key.as_ref();
+            let mut visited = std::collections::BTreeSet::<Vec<u64>>::new();
+            while let Some(key) = cursor {
+                if !visited.insert(key.clone()) {
+                    break;
+                }
+                let Some(info) = layer_infos.get(key).copied() else {
+                    break;
+                };
+                if info.stencil_phase == 1 {
+                    let group = *group_by_owner.entry(key.clone()).or_insert_with(|| {
+                        let source_keys: Vec<Vec<u64>> = if (info.stencil_type & 4) != 0 {
+                            scene
+                                .composite_mask_sources_by_key
+                                .get(key)
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            vec![key.clone()]
+                        };
+                        let sources = source_keys
+                            .iter()
+                            .filter_map(|source| key_to_item.get(source).copied())
+                            .collect::<Vec<_>>();
+                        mask_groups.push(MaskGroup {
+                            sources,
+                            owner: key.clone(),
+                        });
+                        mask_groups.len() - 1
+                    });
+                    if !items[index].mask_groups.contains(&group) {
+                        items[index].mask_groups.push(group);
+                    }
+                } else if info.stencil_phase == 2 {
+                    *skipped.entry("outer-stencil".to_owned()).or_default() += 1;
+                }
+                cursor = info.stencil_parent_native_key.as_ref();
             }
         }
 
         Self {
-            width,
-            height,
+            width: canvas[0].max(1),
+            height: canvas[1].max(1),
             items,
-            mask_groups: pose.mask_groups.clone(),
+            mask_groups,
             skipped,
         }
-    }
-
-    /// Orthographic matrix mapping model pixels to clip space.
-    ///
-    /// Y is flipped so model Y grows downward while NDC Y grows upward.
-    pub fn ortho(&self) -> [[f32; 4]; 4] {
-        let w = self.width.max(1) as f32;
-        let h = self.height.max(1) as f32;
-        [
-            [2.0 / w, 0.0, 0.0, 0.0],
-            [0.0, -2.0 / h, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [-1.0, 1.0, 0.0, 1.0],
-        ]
     }
 
     /// Model-space bounds of all vertices, if any.
@@ -134,6 +202,12 @@ impl RenderPlan {
         let mut max = [f32::NEG_INFINITY; 2];
         let mut any = false;
         for item in &self.items {
+            if matches!(
+                item.pass,
+                EmoteDrawPass::MaskGeneration | EmoteDrawPass::StencilCompositeMask
+            ) {
+                continue;
+            }
             for vertex in &item.vertices {
                 any = true;
                 min[0] = min[0].min(vertex.position[0]);
@@ -161,16 +235,28 @@ impl RenderPlan {
             .items
             .iter()
             .map(|item| {
+                let mut min = [f32::INFINITY; 2];
+                let mut max = [f32::NEG_INFINITY; 2];
+                for vertex in &item.vertices {
+                    min[0] = min[0].min(vertex.position[0]);
+                    min[1] = min[1].min(vertex.position[1]);
+                    max[0] = max[0].max(vertex.position[0]);
+                    max[1] = max[1].max(vertex.position[1]);
+                }
                 serde_json::json!({
                     "label": item.label,
                     "path": item.path,
                     "page": item.page,
+                    "resource": item.resource,
                     "mesh": item.mesh,
                     "division": item.mesh_division,
                     "vertices": item.vertices.len(),
                     "triangles": item.indices.len() / 3,
                     "blend_mode": item.blend_mode,
                     "stencil_type": item.stencil_type,
+                    "pass": format!("{:?}", item.pass),
+                    "masks": item.mask_groups.len(),
+                    "bbox": if item.vertices.is_empty() { None } else { Some([min, max]) },
                 })
             })
             .collect();
@@ -179,178 +265,209 @@ impl RenderPlan {
             "height": self.height,
             "items": items,
             "skipped": self.skipped,
+            "mask_groups": self.mask_groups.len(),
             "vertex_count": self.vertex_count(),
             "triangle_count": self.triangle_count(),
         })
     }
 }
 
-fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'static str> {
-    let src = layer.state.src.as_deref().ok_or("no-src")?;
-    // `blank` layers are structural proxies (deformers, type-12 stencil
-    // owners and mask placement nodes), not color geometry. Drawing them as
-    // white quads covers the face and hair; the official renderer only uses
-    // them while building stencil state.
-    if src == "blank" {
-        return Err("blank-proxy");
-    }
-    let page = model
-        .sources
-        .iter()
-        .find(|page| page.name == src)
-        .ok_or("missing-page")?;
-    let icon_ref = layer.state.icon.as_ref().ok_or("no-icon")?;
-    let (icon, _explicit) = resolve_icon(page, icon_ref).ok_or("missing-icon")?;
-    if icon.width <= 0.0 || icon.height <= 0.0 {
-        return Err("zero-size");
-    }
-    let width = icon.width as f32;
-    let height = icon.height as f32;
-    let origin_x = icon.origin_x as f32;
-    let origin_y = icon.origin_y as f32;
-    let page_width = page.width.max(1);
-    let page_height = page.height.max(1);
-    let world = layer.world;
-
-    // The sprite patch is the accumulated ancestor shape-sync mesh plus the
-    // layer's own `mesh.bp` (see `pose::combine_patch`). An identity patch is
-    // just a quad, so skip tessellation to keep the triangle count bounded.
-    let accumulated = layer.mesh.filter(|patch| !patch.is_identity(1.0e-6));
-    let (vertices, indices, mesh) = if let Some(patch) = accumulated {
-        let grid = MeshGrid::tessellate(
-            &patch,
-            width,
-            height,
-            patch.division.max(layer.mesh_division).max(1),
-        );
-        let vertices = grid
-            .vertices
-            .iter()
-            .map(|vertex| PlanVertex {
-                position: transform_point(world, [vertex.x - origin_x, vertex.y - origin_y]),
-                color: mesh_color(layer, vertex.u, vertex.v),
-                uv: [
-                    (icon.left as f32 + vertex.u * width) / page_width as f32,
-                    (icon.top as f32 + vertex.v * height) / page_height as f32,
-                ],
-            })
-            .collect();
-        (vertices, grid.indices, true)
-    } else {
-        let corners = [
-            [0.0 - origin_x, 0.0 - origin_y],
-            [width - origin_x, 0.0 - origin_y],
-            [0.0 - origin_x, height - origin_y],
-            [width - origin_x, height - origin_y],
-        ];
-        let uvs = [
-            [
-                icon.left as f32 / page_width as f32,
-                icon.top as f32 / page_height as f32,
-            ],
-            [
-                (icon.left as f32 + width) / page_width as f32,
-                icon.top as f32 / page_height as f32,
-            ],
-            [
-                icon.left as f32 / page_width as f32,
-                (icon.top as f32 + height) / page_height as f32,
-            ],
-            [
-                (icon.left as f32 + width) / page_width as f32,
-                (icon.top as f32 + height) / page_height as f32,
-            ],
-        ];
-        let vertices = corners
-            .iter()
-            .zip(uvs.iter())
-            .enumerate()
-            .map(|(index, (position, uv))| PlanVertex {
-                position: transform_point(world, *position),
-                color: corner_color(layer, index),
-                uv: *uv,
-            })
-            .collect();
-        (vertices, vec![0, 1, 2, 1, 3, 2], false)
-    };
-
-    Ok(Some(DrawItem {
-        label: layer.label.clone(),
-        path: layer.path.clone(),
-        page: src.to_string(),
-        resource: page.resource,
-        page_width,
-        page_height,
-        blend_mode: layer.state.blend_mode,
-        mesh,
-        mesh_division: layer.mesh_division,
-        stencil_type: layer.stencil_type,
-        clip_rect: layer.clip_rect.map(|rect| {
-            [
-                rect[0] as f32,
-                rect[1] as f32,
-                rect[2] as f32,
-                rect[3] as f32,
-            ]
-        }),
-        mask_group: layer.mask_group,
-        scope: layer.scope,
-        mask: layer.state.mask,
+fn build_item(sprite: &EmoteStaticSprite) -> DrawItem {
+    let (vertices, indices, mesh_division) = sprite_vertices(sprite);
+    DrawItem {
+        label: sprite
+            .label
+            .clone()
+            .or_else(|| sprite.draw_frame_info.layer_label.clone())
+            .unwrap_or_default(),
+        path: sprite.draw_frame_info.path.clone(),
+        page: if sprite.texture_name.is_empty() {
+            format!("tex#{}", sprite.texture_resource_index)
+        } else {
+            sprite.texture_name.clone()
+        },
+        resource: (!sprite.feedback_history).then_some(sprite.texture_resource_index),
+        page_width: sprite.texture_width.max(1),
+        page_height: sprite.texture_height.max(1),
+        blend_mode: sprite.blend_mode,
+        pass: sprite.draw_frame_info.pass,
+        mesh: sprite.mesh.is_some(),
+        mesh_division,
+        stencil_type: sprite.draw_frame_info.stencil_type,
+        clip_rect: sprite.draw_frame_info.clip_rect,
+        mask_groups: Vec::new(),
+        wipe: [
+            if sprite.draw_frame_info.stencil_wipe_enabled {
+                1.0
+            } else {
+                0.0
+            },
+            sprite.draw_frame_info.stencil_wipe_scale,
+            sprite.draw_frame_info.stencil_wipe_bias,
+        ],
         vertices,
         indices,
-    }))
-}
-
-fn resolve_icon(page: &TextureSource, icon_ref: &IconRef) -> Option<(AtlasIcon, bool)> {
-    if let Some(id) = icon_ref.id {
-        return page.icons.get(&id).cloned().map(|icon| (icon, false));
     }
-    let rect = icon_ref.rect?;
-    Some((
-        AtlasIcon {
-            attr: None,
-            left: rect[0],
-            top: rect[1],
-            width: rect[2],
-            height: rect[3],
-            origin_x: 0.0,
-            origin_y: 0.0,
-        },
-        true,
-    ))
 }
 
-fn corner_color(layer: &LayerPose, index: usize) -> [f32; 4] {
-    // Official frame colors are four corner colors stored as 0xRRGGBBAA
-    // (eluna's `corner_colors` byte order); alpha is the low byte and is
-    // multiplied by the accumulated layer opacity.
-    let rgba = layer.state.color[index.min(3)];
-    let r = ((rgba >> 24) & 0xFF) as f32 / 255.0;
-    let g = ((rgba >> 16) & 0xFF) as f32 / 255.0;
-    let b = ((rgba >> 8) & 0xFF) as f32 / 255.0;
-    let a = (rgba & 0xFF) as f32 / 255.0 * layer.opacity as f32;
-    [r, g, b, a]
+fn sprite_vertices(sprite: &EmoteStaticSprite) -> (Vec<PlanVertex>, Vec<u32>, u32) {
+    let corner_colors = [
+        native_corner_color(sprite, sprite.corner_colors[0]),
+        native_corner_color(sprite, sprite.corner_colors[1]),
+        native_corner_color(sprite, sprite.corner_colors[2]),
+        native_corner_color(sprite, sprite.corner_colors[3]),
+    ];
+    let left = sprite.left();
+    let top = sprite.top();
+    let width = sprite.width;
+    let height = sprite.height;
+
+    if let Some(mesh) = &sprite.mesh {
+        return mesh_vertices(sprite, mesh, left, top, width, height, corner_colors);
+    }
+
+    let right = sprite.right();
+    let bottom = sprite.bottom();
+    let make = |position: [f32; 2], uv: [f32; 2], color: [f32; 4]| PlanVertex {
+        position: transform_sprite_point(sprite, position),
+        color,
+        uv,
+    };
+    let vertices = vec![
+        make(
+            [left, top],
+            [sprite.uv_left, sprite.uv_top],
+            corner_colors[0],
+        ),
+        make(
+            [left, bottom],
+            [sprite.uv_left, sprite.uv_bottom],
+            corner_colors[2],
+        ),
+        make(
+            [right, top],
+            [sprite.uv_right, sprite.uv_top],
+            corner_colors[1],
+        ),
+        make(
+            [right, top],
+            [sprite.uv_right, sprite.uv_top],
+            corner_colors[1],
+        ),
+        make(
+            [left, bottom],
+            [sprite.uv_left, sprite.uv_bottom],
+            corner_colors[2],
+        ),
+        make(
+            [right, bottom],
+            [sprite.uv_right, sprite.uv_bottom],
+            corner_colors[3],
+        ),
+    ];
+    (vertices, vec![0, 1, 2, 3, 4, 5], 0)
 }
 
-fn mesh_color(layer: &LayerPose, u: f32, v: f32) -> [f32; 4] {
-    // Bilinear over the four authored corner colors (top-left, top-right,
-    // bottom-left, bottom-right).
-    let c00 = corner_color(layer, 0);
-    let c10 = corner_color(layer, 1);
-    let c01 = corner_color(layer, 2);
-    let c11 = corner_color(layer, 3);
-    let mut out = [0.0f32; 4];
+#[allow(clippy::too_many_arguments)]
+fn mesh_vertices(
+    sprite: &EmoteStaticSprite,
+    mesh: &EmoteMeshPatch,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    corner_colors: [[f32; 4]; 4],
+) -> (Vec<PlanVertex>, Vec<u32>, u32) {
+    let division_x = mesh.division_x.max(1);
+    let division_y = mesh.division_y.max(1);
+    let vertex_at = |ix: u32, iy: u32| -> PlanVertex {
+        let u = ix as f32 / division_x as f32;
+        let v = iy as f32 / division_y as f32;
+        let sample = mesh.sample(u, v);
+        let position = [left + sample[0] * width, top + sample[1] * height];
+        PlanVertex {
+            position: transform_sprite_point(sprite, position),
+            color: bilerp_color(corner_colors, u, v),
+            uv: [
+                sprite.uv_left + (sprite.uv_right - sprite.uv_left) * u,
+                sprite.uv_top + (sprite.uv_bottom - sprite.uv_top) * v,
+            ],
+        }
+    };
+
+    let mut vertices = Vec::with_capacity((division_x * division_y * 6) as usize);
+    let mut indices = Vec::with_capacity((division_x * division_y * 6) as usize);
+    for y in 0..division_y {
+        for x in 0..division_x {
+            indices.extend_from_slice(&[
+                vertices.len() as u32,
+                vertices.len() as u32 + 1,
+                vertices.len() as u32 + 2,
+                vertices.len() as u32 + 3,
+                vertices.len() as u32 + 4,
+                vertices.len() as u32 + 5,
+            ]);
+            vertices.push(vertex_at(x, y));
+            vertices.push(vertex_at(x, y + 1));
+            vertices.push(vertex_at(x + 1, y));
+            vertices.push(vertex_at(x + 1, y));
+            vertices.push(vertex_at(x, y + 1));
+            vertices.push(vertex_at(x + 1, y + 1));
+        }
+    }
+    (vertices, indices, division_x.max(division_y))
+}
+
+fn native_corner_color(sprite: &EmoteStaticSprite, packed: u32) -> [f32; 4] {
+    // Frame colors are 0xRRGGBBAA. Only the alpha byte is multiplied by layer
+    // opacity; the neutral RGB byte for MODULATE2X is 0x80.
+    let r = ((packed >> 24) & 0xFF) as f32 / 255.0;
+    let g = ((packed >> 16) & 0xFF) as f32 / 255.0;
+    let b = ((packed >> 8) & 0xFF) as f32 / 255.0;
+    let a = (packed & 0xFF) as f32 / 255.0;
+    [r, g, b, (a * sprite.opacity).clamp(0.0, 1.0)]
+}
+
+fn bilerp_color(corners: [[f32; 4]; 4], u: f32, v: f32) -> [f32; 4] {
+    // Native corner order follows the rectangle: TL, TR, BL, BR.
+    let mut out = [0.0; 4];
     for channel in 0..4 {
-        let top = c00[channel] + (c10[channel] - c00[channel]) * u;
-        let bottom = c01[channel] + (c11[channel] - c01[channel]) * u;
+        let top = corners[0][channel] + (corners[1][channel] - corners[0][channel]) * u;
+        let bottom = corners[2][channel] + (corners[3][channel] - corners[2][channel]) * u;
         out[channel] = top + (bottom - top) * v;
     }
     out
 }
 
-fn transform_point(world: Affine2, point: [f32; 2]) -> [f32; 2] {
-    let out = world.apply([point[0] as f64, point[1] as f64]);
-    [out[0] as f32, out[1] as f32]
+fn transform_sprite_point(sprite: &EmoteStaticSprite, point: [f32; 2]) -> [f32; 2] {
+    let sx = if sprite.scale_x.is_finite() {
+        sprite.scale_x
+    } else {
+        1.0
+    };
+    let sy = if sprite.scale_y.is_finite() {
+        sprite.scale_y
+    } else {
+        1.0
+    };
+    let angle = if sprite.rotation_degrees.is_finite() {
+        sprite.rotation_degrees.to_radians()
+    } else {
+        0.0
+    };
+    let cos = angle.cos();
+    let sin = angle.sin();
+    let dx = (point[0] - sprite.center_x) * sx;
+    let dy = (point[1] - sprite.center_y) * sy;
+    let local = [
+        sprite.center_x + dx * cos - dy * sin,
+        sprite.center_y + dx * sin + dy * cos,
+    ];
+    let m = sprite.world_transform;
+    [
+        m[0] * local[0] + m[1] * local[1] + m[4],
+        m[2] * local[0] + m[3] * local[1] + m[5],
+    ]
 }
 
 #[cfg(test)]
@@ -358,39 +475,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn color_is_rgba() {
-        let layer = LayerPose {
-            label: String::new(),
-            path: String::new(),
-            kind: 0,
-            sample_time: 0.0,
-            state: crate::pose::FrameState {
-                color: [0x80FF_8040; 4],
-                ..Default::default()
-            },
-            local: Affine2::identity(),
-            world: Affine2::identity(),
-            world_origin: [0.0; 3],
-            opacity: 1.0,
+    fn corner_color_is_rrggbbaa() {
+        let mut sprite = EmoteStaticSprite {
+            label: None,
+            motion_name: String::new(),
+            texture_name: String::new(),
+            texture_resource_index: 0,
+            texture_width: 1,
+            texture_height: 1,
+            texture_format: None,
+            icon_name: String::new(),
+            feedback_history: false,
+            z: 0.0,
+            opacity: 0.5,
+            blend_mode: 0,
+            blend_parameter: 0.0,
+            corner_colors: [0x80FF_8040; 4],
             visible: true,
-            drawable: true,
-            mesh_division: 1,
-            mesh_transform: 0,
-            mesh_combine: false,
-            stencil_type: 0,
-            clip_rect: None,
-            anchor_mode: 0,
-            mask_group: None,
-            scope: 0,
+            center_x: 0.0,
+            center_y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation_degrees: 0.0,
+            world_transform: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            uv_left: 0.0,
+            uv_top: 0.0,
+            uv_right: 1.0,
+            uv_bottom: 1.0,
             mesh: None,
-            mesh_chain: Vec::new(),
-            priority_path: Vec::new(),
-            children: Vec::new(),
+            draw_frame_info: EmoteDrawFrameInfo {
+                layer_label: None,
+                native_draw_key: Vec::new(),
+                draw_index: 0,
+                path: String::new(),
+                layer_type: 0,
+                ready_to_draw: true,
+                submitted_to_draw_frame: true,
+                mesh_transform: 0,
+                mesh_combine: false,
+                mesh_sync_child_mask: 0,
+                mesh_sync_child_coord: false,
+                mesh_sync_child_angle: false,
+                mesh_sync_child_zoom: false,
+                mesh_sync_child_shape: false,
+                join_target: false,
+                inherit_mask: None,
+                inherit_parent: false,
+                inherit_opacity: false,
+                inherit_shape: false,
+                inherit_angle: false,
+                transform_order: Vec::new(),
+                coordinate: None,
+                ground_correction: false,
+                obj_tri_priority: 0,
+                clip_rect: None,
+                stencil_type: 0,
+                stencil_phase: 0,
+                stencil_composite_item: false,
+                stencil_wipe_enabled: false,
+                stencil_wipe_reverse: false,
+                stencil_wipe_scale: 0.0,
+                stencil_wipe_bias: 0.0,
+                stencil_composite_mask_layer_list: Vec::new(),
+                stencil_composite_target_paths: Vec::new(),
+                parent_mask_path: None,
+                stencil_parent_path: None,
+                stencil_parent_native_key: None,
+                control_parameter: None,
+                control_value: None,
+                local_time_ticks: None,
+                frame_index: None,
+                next_frame_index: None,
+                interpolation_t: 0.0,
+                pass: EmoteDrawPass::Normal,
+            },
         };
-        let color = corner_color(&layer, 0);
+        let color = native_corner_color(&sprite, sprite.corner_colors[0]);
         assert!((color[0] - (128.0 / 255.0)).abs() < 1e-6);
         assert!((color[1] - 1.0).abs() < 1e-6);
         assert!((color[2] - (128.0 / 255.0)).abs() < 1e-6);
-        assert!((color[3] - (64.0 / 255.0)).abs() < 1e-6);
+        assert!((color[3] - (32.0 / 255.0)).abs() < 1e-6);
+        sprite.opacity = 1.0;
+        assert!((native_corner_color(&sprite, 0x0000_00FF)[3] - 1.0).abs() < 1e-6);
     }
 }

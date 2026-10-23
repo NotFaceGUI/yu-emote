@@ -1,0 +1,8 @@
+# E-mote scene evaluation (nested motions, mesh chains) is recursive and uses
+# substantially more stack in debug builds. Give our binaries and test threads
+# enough stack so debug tooling behaves like the release runtime.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:33554432"]
+
+[env]
+RUST_MIN_STACK = "33554432"

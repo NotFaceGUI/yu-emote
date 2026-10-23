@@ -1,53 +1,48 @@
-//! Deterministic software rasterizer for the M3 draw plan.
-//! Algorithms and native semantics adapted from eluna (MPL-2.0,
-//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
+//! Deterministic CPU rasterizer for previews, screenshots and pixel checks.
 //!
-//! This is a reference path used to validate data/pose/plan without a GPU and
-//! to produce deterministic screenshots for comparison. It is **not** the
-//! final M3 renderer: wgpu is the delivery target and the official D3D9
-//! blend/sampling state still needs M4 parity.
+//! The vertex math and blend equations match the reference `eluna_player`
+//! WebGPU path, but evaluation is done in software so the CLI tools can emit
+//! PNG sequences without a GPU or window:
 //!
-//! Implemented:
-//! - textured triangles with bilinear sampling (clamp-to-edge);
-//! - vertex corner colors (`0xRRGGBBAA`) multiplied with the texel;
-//! - straight-alpha source-over blending;
-//! - mesh and quad items from [`RenderPlan`];
-//! - composite alpha masks (`stencilType & 4`): sources are rasterized into
-//!   per-group coverage buffers and multiply descendant alpha.
+//! - triangles are rasterized with barycentric coverage and bilinear atlas
+//!   sampling;
+//! - the native texture stage (`MODULATE2X` high nibble, modes 3/4 alpha
+//!   premultiply, mode 5 complement) runs after `texture * diffuse`;
+//! - the D3D9 blend table from `MMotionDevice::SetBlendMode` is applied per
+//!   pixel;
+//! - inner stencil owners are approximated as coverage buffers (union of the
+//!   owner's source sprites) multiplied into each dependent sprite.
 //!
-//! Not implemented (counted in [`SoftStats`]):
-//! - non-normal blend modes (`bm` other than the default 0x10);
-//! - the type-7 clip rectangle;
-//! - pixelate screen-space pass.
+//! Not covered: outer-stencil reference counting, feedback history, type-4
+//! particles and stereovision. Those are reported by [`SoftStats`] or as
+//! skipped plan entries rather than silently invented.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
 use crate::error::EmoteError;
-use crate::plan::{PlanVertex, RenderPlan};
-use crate::pose::Pose;
-use crate::schema::Model;
-use crate::texture::{self, DecodedTexture};
+use crate::plan::{DrawItem, PlanVertex, RenderPlan};
+use crate::texture::DecodedTexture;
 
-/// Rendered RGBA8 image, top-left origin.
+/// Rendered RGBA8 image.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderImage {
-    /// Width in pixels.
+    /// Output width.
     pub width: u32,
-    /// Height in pixels.
+    /// Output height.
     pub height: u32,
-    /// Tightly packed RGBA8 pixels.
+    /// Tightly packed RGBA8 pixels, `width * height * 4` bytes.
     pub rgba8: Vec<u8>,
 }
 
 impl RenderImage {
-    /// Pixel count.
+    /// Number of pixels.
     pub fn pixel_count(&self) -> usize {
         self.width as usize * self.height as usize
     }
 
-    /// Borrow one pixel.
+    /// Borrow one pixel as RGBA.
     pub fn pixel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
         if x >= self.width || y >= self.height {
             return None;
@@ -63,51 +58,54 @@ impl RenderImage {
 
     /// Number of pixels with non-zero alpha.
     pub fn covered_pixels(&self) -> usize {
-        self.rgba8.chunks_exact(4).filter(|px| px[3] != 0).count()
+        self.rgba8.chunks_exact(4).filter(|p| p[3] > 0).count()
     }
 
-    /// Bounding box of non-zero-alpha pixels, if any.
+    /// Bounding box of non-zero alpha pixels (`left, top, right, bottom`).
     pub fn coverage_bbox(&self) -> Option<(u32, u32, u32, u32)> {
-        let mut bbox: Option<(u32, u32, u32, u32)> = None;
+        let mut min_x = self.width;
+        let mut min_y = self.height;
+        let mut max_x = 0u32;
+        let mut max_y = 0u32;
+        let mut any = false;
         for y in 0..self.height {
             for x in 0..self.width {
-                if self.rgba8[(y as usize * self.width as usize + x as usize) * 4 + 3] != 0 {
-                    bbox = Some(match bbox {
-                        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
-                        None => (x, y, x, y),
-                    });
+                let index = (y as usize * self.width as usize + x as usize) * 4;
+                if self.rgba8[index + 3] > 0 {
+                    any = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
                 }
             }
         }
-        bbox
+        any.then_some((min_x, min_y, max_x + 1, max_y + 1))
     }
 }
 
-/// Rasterizer counters.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// Counters describing what the rasterizer consumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SoftStats {
-    /// Draw items submitted.
+    /// Color draw items visited.
     pub items: usize,
     /// Triangles rasterized.
     pub triangles: usize,
-    /// Pixels covered by a triangle (before blending).
+    /// Pixels touched by at least one triangle.
     pub covered: usize,
-    /// Items skipped because their page had no decodable texture.
-    pub missing_textures: usize,
-    /// Items using a non-default blend mode (rendered with normal alpha).
+    /// Items with a non-default blend mode.
     pub non_default_blend: usize,
-    /// Items carrying mask/stencil state.
+    /// Items with at least one stencil owner.
     pub masked_items: usize,
-    /// Source draw items rasterized into composite-mask buffers.
+    /// Mask source items rasterized.
     pub mask_sources: usize,
+    /// Items whose texture resource was unavailable.
+    pub missing_textures: usize,
+    /// Items skipped because they need feedback history.
+    pub feedback: usize,
 }
 
 /// Presentation transform applied to plan vertices before rasterization.
-///
-/// E-mote model coordinates are not screen coordinates: the YU-RIS host
-/// composites the character with a scene-specific position/scale. The plan
-/// stays in model space; this transform is supplied by the caller (the CLI
-/// uses `fit` for previews, the kernel will use the CG layer transform).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ViewTransform {
     /// Uniform scale.
@@ -173,6 +171,117 @@ fn screen_clip(rect: Option<[f32; 4]>, view: ViewTransform) -> Option<[f32; 4]> 
     ])
 }
 
+fn color_item(item: &DrawItem) -> bool {
+    !matches!(
+        item.pass,
+        crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
+    )
+}
+
+/// Render a plan with already decoded textures keyed by PSB resource index.
+pub fn render_with_textures(
+    plan: &RenderPlan,
+    textures: &BTreeMap<u32, DecodedTexture>,
+    view: ViewTransform,
+) -> Result<(RenderImage, SoftStats), EmoteError> {
+    let width = plan.width.max(1);
+    let height = plan.height.max(1);
+    let mut rgba8 = vec![0u8; width as usize * height as usize * 4];
+    let mut stats = SoftStats::default();
+
+    let mut masks: Vec<Option<Vec<f32>>> = Vec::with_capacity(plan.mask_groups.len());
+    for group in &plan.mask_groups {
+        let mut buffer = vec![0.0f32; width as usize * height as usize];
+        let mut used = false;
+        for source_index in &group.sources {
+            let Some(item) = plan.items.get(*source_index) else {
+                continue;
+            };
+            let Some(texture) = item_texture(item, textures) else {
+                continue;
+            };
+            used = true;
+            stats.mask_sources += 1;
+            let clip = screen_clip(item.clip_rect, view);
+            for triangle in item.indices.chunks_exact(3) {
+                let (Some(v0), Some(v1), Some(v2)) = (
+                    item.vertices.get(triangle[0] as usize),
+                    item.vertices.get(triangle[1] as usize),
+                    item.vertices.get(triangle[2] as usize),
+                ) else {
+                    continue;
+                };
+                rasterize_triangle_coverage(
+                    &mut buffer, width, height, texture, v0, v1, v2, view, clip,
+                );
+            }
+        }
+        masks.push(used.then_some(buffer));
+    }
+
+    for item in &plan.items {
+        if !color_item(item) {
+            continue;
+        }
+        stats.items += 1;
+        if (1..=5).contains(&(item.blend_mode & 0xFF0F)) {
+            stats.non_default_blend += 1;
+        }
+        if !item.mask_groups.is_empty() {
+            stats.masked_items += 1;
+        }
+        if item.resource.is_none() {
+            stats.feedback += 1;
+            continue;
+        }
+        let Some(texture) = item_texture(item, textures) else {
+            stats.missing_textures += 1;
+            continue;
+        };
+        let clip = screen_clip(item.clip_rect, view);
+        for triangle in item.indices.chunks_exact(3) {
+            let (Some(v0), Some(v1), Some(v2)) = (
+                item.vertices.get(triangle[0] as usize),
+                item.vertices.get(triangle[1] as usize),
+                item.vertices.get(triangle[2] as usize),
+            ) else {
+                continue;
+            };
+            stats.triangles += 1;
+            stats.covered += rasterize_triangle(
+                &mut rgba8,
+                width,
+                height,
+                texture,
+                v0,
+                v1,
+                v2,
+                view,
+                &masks,
+                &item.mask_groups,
+                clip,
+                item.blend_mode,
+                item.wipe,
+            );
+        }
+    }
+    Ok((
+        RenderImage {
+            width,
+            height,
+            rgba8,
+        },
+        stats,
+    ))
+}
+
+fn item_texture<'a>(
+    item: &DrawItem,
+    textures: &'a BTreeMap<u32, DecodedTexture>,
+) -> Option<&'a DecodedTexture> {
+    item.resource.and_then(|resource| textures.get(&resource))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rasterize_triangle(
     target: &mut [u8],
@@ -183,9 +292,11 @@ fn rasterize_triangle(
     v1: &PlanVertex,
     v2: &PlanVertex,
     view: ViewTransform,
-    mask: Option<&[f32]>,
+    masks: &[Option<Vec<f32>>],
+    mask_groups: &[usize],
     clip: Option<[f32; 4]>,
     blend_mode: u32,
+    wipe: [f32; 3],
 ) -> usize {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
@@ -211,9 +322,28 @@ fn rasterize_triangle(
     if area.abs() < 1e-9 {
         return 0;
     }
+
     let mut covered = 0;
     for y in min_y..=max_y {
         for x in min_x..=max_x {
+            let index = y as usize * width as usize + x as usize;
+            let mut alpha_scale = 1.0f32;
+            for group in mask_groups {
+                let Some(Some(mask)) = masks.get(*group) else {
+                    alpha_scale = 0.0;
+                    break;
+                };
+                let coverage = mask[index];
+                if coverage <= 0.003 {
+                    alpha_scale = 0.0;
+                    break;
+                }
+                alpha_scale *= coverage;
+            }
+            if alpha_scale <= 0.0 {
+                continue;
+            }
+
             let point = [x as f32 + 0.5, y as f32 + 0.5];
             let w0 = edge(p1, p2, point) / area;
             let w1 = edge(p2, p0, point) / area;
@@ -232,14 +362,9 @@ fn rasterize_triangle(
                 v0.color[3] * w0 + v1.color[3] * w1 + v2.color[3] * w2,
             ];
             let texel = sample_bilinear(texture, uv);
-            let index = (y as usize * width as usize + x as usize) * 4;
-            let mut alpha = color[3];
-            if let Some(mask) = mask {
-                let coverage = mask[y as usize * width as usize + x as usize];
-                if coverage <= 0.003 {
-                    continue;
-                }
-                alpha *= coverage;
+            let mut alpha = color[3] * alpha_scale;
+            if wipe[0] > 0.5 {
+                alpha = (alpha * wipe[1] + wipe[2]).clamp(0.0, 1.0);
             }
             let mut src = [
                 texel[0] * color[0],
@@ -247,8 +372,6 @@ fn rasterize_triangle(
                 texel[2] * color[2],
                 texel[3] * alpha,
             ];
-            // MMotionDevice::SetBlendMode (`sub_1041A190`): the high nibble
-            // 0x10 selects D3DTOP_MODULATE2X on texture stage 0.
             if (blend_mode & 0xF0) == 0x10 {
                 src[0] = (src[0] * 2.0).min(1.0);
                 src[1] = (src[1] * 2.0).min(1.0);
@@ -264,10 +387,11 @@ fn rasterize_triangle(
                 src[1] = 1.0 - src[1];
                 src[2] = 1.0 - src[2];
             }
+            let pixel = &mut target[index * 4..index * 4 + 4];
             if low == 0 {
-                blend_source_over(&mut target[index..index + 4], src);
+                blend_source_over(pixel, src);
             } else {
-                blend_pixel(&mut target[index..index + 4], src, low);
+                blend_pixel(pixel, src, low);
             }
             covered += 1;
         }
@@ -311,8 +435,6 @@ fn sample_bilinear(texture: &DecodedTexture, uv: [f32; 2]) -> [f32; 4] {
 }
 
 fn blend_pixel(dst: &mut [u8], src: [f32; 4], mode: u32) {
-    // Native blend table (`sub_1041A190`); low nibble modes 1..5 select
-    // additive / reverse-subtract / modulate combinations.
     let dst_color = [
         dst[0] as f32 / 255.0,
         dst[1] as f32 / 255.0,
@@ -382,195 +504,6 @@ fn blend_source_over(dst: &mut [u8], src: [f32; 4]) {
     dst[3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
 }
 
-/// Render helper that decodes pages from a parsed document.
-///
-/// [`render_with_document`] uses this path; [`render_plan_with_document`] is
-/// kept for callers that already built a plan (the wgpu backend will supply
-/// its own textures).
-pub fn render_with_document(
-    document: &crate::psb::PsbDocument,
-    model: &Model,
-    pose: &Pose,
-    view: ViewTransform,
-) -> Result<(RenderImage, SoftStats), EmoteError> {
-    let plan = RenderPlan::build(model, pose);
-    render_plan_with_document(document, model, &plan, view)
-}
-
-/// Render an existing plan, decoding atlas pages from `document`.
-pub fn render_plan_with_document(
-    document: &crate::psb::PsbDocument,
-    model: &Model,
-    plan: &RenderPlan,
-    view: ViewTransform,
-) -> Result<(RenderImage, SoftStats), EmoteError> {
-    let textures = decode_textures(document, model, plan)?;
-    render_with_textures(plan, &textures, view)
-}
-
-/// Decode every texture page referenced by `plan` once.
-///
-/// Animation tooling can reuse the returned map across frames instead of
-/// decoding the same atlas pages for every rendered image.
-pub fn decode_textures(
-    document: &crate::psb::PsbDocument,
-    model: &Model,
-    plan: &RenderPlan,
-) -> Result<BTreeMap<String, DecodedTexture>, EmoteError> {
-    let mut textures: BTreeMap<String, DecodedTexture> = BTreeMap::new();
-    for item in &plan.items {
-        if textures.contains_key(&item.page) {
-            continue;
-        }
-        if item.page == "blank" {
-            textures.insert(
-                "blank".to_string(),
-                DecodedTexture {
-                    width: 1,
-                    height: 1,
-                    rgba8: vec![255, 255, 255, 255],
-                },
-            );
-            continue;
-        }
-        let Some(page) = model.sources.iter().find(|page| page.name == item.page) else {
-            continue;
-        };
-        textures.insert(item.page.clone(), texture::decode_page(document, page)?);
-    }
-    Ok(textures)
-}
-
-/// Render a plan with an already decoded texture set.
-pub fn render_with_textures(
-    plan: &RenderPlan,
-    textures: &BTreeMap<String, DecodedTexture>,
-    view: ViewTransform,
-) -> Result<(RenderImage, SoftStats), EmoteError> {
-    let width = plan.width.max(1);
-    let height = plan.height.max(1);
-    let mut rgba8 = vec![0u8; width as usize * height as usize * 4];
-    let mut stats = SoftStats::default();
-
-    // Composite alpha masks (`stencilType & 4`). Each owner's named source
-    // layers are rasterized into a coverage buffer in the same motion scope;
-    // descendants are then multiplied by that coverage. This mirrors the
-    // native inner-stencil union plus the shader's alpha discard.
-    let mut masks: Vec<Option<Vec<f32>>> = Vec::with_capacity(plan.mask_groups.len());
-    for (group_id, group) in plan.mask_groups.iter().enumerate() {
-        let used = plan
-            .items
-            .iter()
-            .any(|item| item.mask_group == Some(group_id));
-        if !used {
-            masks.push(None);
-            continue;
-        }
-        let mut buffer = vec![0.0f32; width as usize * height as usize];
-        let mut source_count = 0usize;
-        for item in &plan.items {
-            // Source paths were resolved in the pose (own scope; type-3
-            // proxies expand to their nested player's emitted sprites).
-            if !group.source_paths.iter().any(|path| path == &item.path) {
-                continue;
-            }
-            let Some(texture) = textures.get(&item.page) else {
-                continue;
-            };
-            source_count += 1;
-            for triangle in item.indices.chunks_exact(3) {
-                let (Some(v0), Some(v1), Some(v2)) = (
-                    item.vertices.get(triangle[0] as usize),
-                    item.vertices.get(triangle[1] as usize),
-                    item.vertices.get(triangle[2] as usize),
-                ) else {
-                    continue;
-                };
-                rasterize_triangle_coverage(
-                    &mut buffer,
-                    width,
-                    height,
-                    texture,
-                    v0,
-                    v1,
-                    v2,
-                    view,
-                    screen_clip(item.clip_rect, view),
-                );
-            }
-        }
-        stats.mask_sources += source_count;
-        if let Ok(dir) = std::env::var("YU_EMOTE_DUMP_MASKS") {
-            let mut pgm = format!(
-                "P5
-{} {}
-255
-",
-                width, height
-            )
-            .into_bytes();
-            pgm.extend(
-                buffer
-                    .iter()
-                    .map(|value| (value.clamp(0.0, 1.0) * 255.0) as u8),
-            );
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(format!("{dir}/mask-{group_id}.pgm"), pgm);
-        }
-        masks.push(Some(buffer));
-    }
-
-    for item in &plan.items {
-        stats.items += 1;
-        if (1..=5).contains(&(item.blend_mode & 0xFF0F)) {
-            stats.non_default_blend += 1;
-        }
-        if item.mask != 0 || item.stencil_type != 0 || item.mask_group.is_some() {
-            stats.masked_items += 1;
-        }
-        let Some(texture) = textures.get(&item.page) else {
-            stats.missing_textures += 1;
-            continue;
-        };
-        let mask = item
-            .mask_group
-            .and_then(|group| masks.get(group))
-            .and_then(|mask| mask.as_deref());
-        let clip = screen_clip(item.clip_rect, view);
-        for triangle in item.indices.chunks_exact(3) {
-            let (Some(v0), Some(v1), Some(v2)) = (
-                item.vertices.get(triangle[0] as usize),
-                item.vertices.get(triangle[1] as usize),
-                item.vertices.get(triangle[2] as usize),
-            ) else {
-                continue;
-            };
-            stats.triangles += 1;
-            stats.covered += rasterize_triangle(
-                &mut rgba8,
-                width,
-                height,
-                texture,
-                v0,
-                v1,
-                v2,
-                view,
-                mask,
-                clip,
-                item.blend_mode,
-            );
-        }
-    }
-    Ok((
-        RenderImage {
-            width,
-            height,
-            rgba8,
-        },
-        stats,
-    ))
-}
-
 /// Rasterize one triangle into an alpha-coverage buffer.
 ///
 /// Coverage is the union (max) of texture alpha times vertex alpha, matching
@@ -626,11 +559,16 @@ fn rasterize_triangle_coverage(
                 v0.uv[0] * w0 + v1.uv[0] * w1 + v2.uv[0] * w2,
                 v0.uv[1] * w0 + v1.uv[1] * w1 + v2.uv[1] * w2,
             ];
-            let alpha = (v0.color[3] * w0 + v1.color[3] * w1 + v2.color[3] * w2)
-                * sample_bilinear(texture, uv)[3];
+            let alpha = v0.color[3] * w0 + v1.color[3] * w1 + v2.color[3] * w2;
+            let texel = sample_bilinear(texture, uv);
             let index = y as usize * width as usize + x as usize;
-            target[index] = target[index].max(alpha.clamp(0.0, 1.0));
-            covered += 1;
+            let value = (alpha * texel[3]).clamp(0.0, 1.0);
+            if value > target[index] {
+                target[index] = value;
+            }
+            if value > 0.003 {
+                covered += 1;
+            }
         }
     }
     covered
@@ -641,21 +579,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_blend_modes_are_applied() {
-        let mut pixel = [0u8, 0, 0, 255];
-        blend_pixel(&mut pixel, [0.5, 0.0, 0.0, 1.0], 1);
-        assert_eq!(pixel, [128, 0, 0, 255]);
-        let mut pixel = [0u8, 0, 0, 255];
-        blend_pixel(&mut pixel, [0.5, 0.0, 0.0, 1.0], 2);
-        assert_eq!(pixel, [0, 0, 0, 255]);
-    }
-
-    #[test]
-    fn source_over_is_stable() {
-        let mut pixel = [0u8, 0, 0, 0];
-        blend_source_over(&mut pixel, [1.0, 0.0, 0.0, 0.5]);
-        assert_eq!(pixel, [255, 0, 0, 128]);
-        blend_source_over(&mut pixel, [0.0, 0.0, 1.0, 0.5]);
-        assert_eq!(pixel, [85, 0, 170, 192]);
+    fn empty_plan_falls_back_to_identity_view() {
+        let plan = RenderPlan {
+            width: 100,
+            height: 100,
+            items: vec![],
+            mask_groups: vec![],
+            skipped: BTreeMap::new(),
+        };
+        assert_eq!(ViewTransform::fit(&plan, 10.0), ViewTransform::identity());
     }
 }

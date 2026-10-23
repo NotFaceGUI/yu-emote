@@ -11,44 +11,29 @@ pub enum EmoteError {
     #[error("I/O: {0}")]
     Io(#[from] io::Error),
 
-    /// The file does not start with the PSB or MDF signature.
-    #[error("not a PSB or MDF file")]
-    InvalidSignature,
+    /// The PSB container could not be decoded.
+    #[error("PSB: {0}")]
+    Psb(#[from] eluna::PsbError),
 
-    /// The PSB header is truncated or contains impossible offsets.
-    #[error("invalid PSB header")]
-    InvalidHeader,
+    /// The E-mote schema in the PSB tree could not be interpreted.
+    #[error("E-mote schema: {0}")]
+    Schema(#[from] eluna::EmoteSchemaError),
 
-    /// The PSB header itself is encrypted (PSB v3+); not supported yet.
-    #[error("encrypted PSB header is not supported yet")]
-    EncryptedHeaderUnsupported,
+    /// The runtime rejected a control call.
+    #[error("E-mote runtime: {0}")]
+    Runtime(#[from] eluna::EmoteRuntimeError),
 
-    /// The PSB body is encrypted and no key was supplied.
-    #[error("PSB body is encrypted; supply the E-mote key")]
-    EncryptedPsbRequiresKey,
+    /// A model does not contain the requested motion.
+    #[error("unknown motion `{0}`")]
+    UnknownMotion(String),
 
-    /// The PSB header or index could not be opened.
-    #[error("PSB open: {0}")]
-    PsbOpen(#[from] emote_psb::psb::error::PsbOpenError),
+    /// A model does not contain the requested timeline.
+    #[error("unknown timeline `{0}`")]
+    UnknownTimeline(String),
 
-    /// The PSB value tree could not be decoded.
-    #[error("PSB decode: {0}")]
-    PsbDecode(#[from] emote_psb::value::de::Error),
-
-    /// The MDF container could not be opened.
-    #[error("MDF open: {0}")]
-    MdfOpen(#[from] emote_psb::mdf::error::MdfOpenError),
-
-    /// A parameter was used with a type the adapter does not understand.
-    #[error("unsupported type for E-mote parameter `{name}`")]
-    UnsupportedParameterType {
-        /// Parameter name as it appears in the YU-RIS command table.
-        name: String,
-    },
-
-    /// An `EMOTEINFO` field has no evidence-backed semantics yet.
-    #[error("unsupported EMOTEINFO field `{0}`")]
-    UnsupportedInfo(String),
+    /// A model does not contain the requested variable.
+    #[error("unknown variable `{0}`")]
+    UnknownVariable(String),
 
     /// A texture page uses a format this build cannot decode.
     #[error("unsupported texture format `{format}`")]
@@ -88,13 +73,16 @@ pub enum EmoteError {
         height: u32,
     },
 
-    /// A model does not contain the requested timeline.
-    #[error("unknown timeline `{0}`")]
-    UnknownTimeline(String),
+    /// A parameter was used with a type the adapter does not understand.
+    #[error("unsupported type for E-mote parameter `{name}`")]
+    UnsupportedParameterType {
+        /// Parameter name as it appears in the YU-RIS command table.
+        name: String,
+    },
 
-    /// A model does not contain the requested variable.
-    #[error("unknown variable `{0}`")]
-    UnknownVariable(String),
+    /// An `EMOTEINFO` field has no evidence-backed semantics yet.
+    #[error("unsupported EMOTEINFO field `{0}`")]
+    UnsupportedInfo(String),
 
     /// The adapter is not allowed to advance animation yet.
     #[error("E-mote runtime is not ready (capability: {0})")]

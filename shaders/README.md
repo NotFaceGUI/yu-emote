@@ -49,16 +49,12 @@ Vertex programs:
 The bind-group layout is not final: the runtime may move the sampler to a
 separate group. The uniform *semantics* are what this folder records.
 
-## Regenerating
+## Status
 
-```bash
-cargo run --bin gen-shaders
-```
-
-The generator lives in `src/render.rs`
-(`generated_pixel_wgsl`/`generated_vertex_wgsl`). The
-`shader_files_match_generator` test fails if a file drifts from it, and
-`all_official_shader_files_are_present` checks all 58 entries.
+These files are kept as an evidence record of the official shader table. After
+the runtime refactor the project uses the vendored `eluna` scene evaluator and
+the software rasterizer in `src/soft.rs`; no Rust module includes these WGSL
+files anymore, and there is no generator binary in the workspace.
 
 ## Evidence gaps
 

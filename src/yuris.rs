@@ -11,8 +11,9 @@
 //! - `EMOTEINFO` field semantics are **not** evidenced yet; queries for
 //!   anything outside the recorded numeric set return
 //!   [`EmoteError::UnsupportedInfo`] instead of inventing a value.
-//! - `SYSTEMINFO[EMOTE]` is a capability bit. Until a renderer exists, report
-//!   [`Capability::Unavailable`] so scripts do not take the E-mote branch.
+//! - `SYSTEMINFO[EMOTE]` is a capability bit. [`Capability::Ready`] means the
+//!   vendored runtime and renderer are linked; [`Capability::DataOnly`] keeps
+//!   scripted animation disabled while still allowing inspection.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

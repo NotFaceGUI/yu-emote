@@ -2,11 +2,12 @@
 
 ## Goals
 
-- Faithful, deterministic reimplementation of the E-mote runtime pieces a
-  YU-RIS game needs: PSB model data, parameters/motions, mesh deformation and
-  rendering.
-- Native and `wasm32-unknown-unknown` from the same Rust code.
-- Clear separation between **E-mote core** and **YU-RIS glue**.
+- Faithful, deterministic E-mote runtime for YU-RIS: PSB model data,
+  parameters/motions, mesh deformation and rendering.
+- One animation implementation, not a project-local approximation. The
+  vendored `eluna` runtime owns scene evaluation; this project adapts data,
+  rendering and YU-RIS integration around it.
+- Clear separation between **E-mote runtime** and **YU-RIS glue**.
 
 ## Non-goals (for now)
 
@@ -18,120 +19,107 @@
 ## Layers
 
 ```text
-┌─────────────────────────────────────────────────────────────┐
-│ yu-emote                                                    │
-│                                                             │
-│  psb      PSB/MDF container, body cipher, resources         │
-│   │                                                         │
-│  model    generic tree summary                              │
-│  schema   typed model: atlas, objects, layers, timelines    │
-│  texture  RGBA4444 atlas decode (A4R4G4B4 order)            │
-│   │                                                         │
-│  anim     variables, timelines, fades, deterministic clock  │
-│  pose     layer/frame evaluation, transforms, nested motions│
-│  plan     pose -> textured mesh draw list                   │
-│  soft     deterministic CPU rasterizer (baseline)           │
-│   │                                                         │
-│  render   58 WGSL variants, Bezier mesh tessellation        │
-│                                                             │
-│  yuris    EMOTE/EMOTEINFO, capability, suspend, dirty       │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ vendor/eluna  (MPL-2.0, upstream 9a00029)                        │
+│   psb        PSB/MDF parse, decryption, resources                │
+│   emote      schema, motion scenes, mesh chain, anchors, clips   │
+│   runtime    timelines, transitions, loops, physics, controls    │
+│   sdk        EmoteRuntime (SDK-shaped player state machine)      │
+└──────────────────────────────┬───────────────────────────────────┘
+                               │ evaluated EmoteStaticScene
+┌──────────────────────────────┴───────────────────────────────────┐
+│ yu-emote                                                         │
+│                                                                  │
+│  psb       YU-RIS loader, explicit per-game key, resources       │
+│  runtime   Emote<EmoteRuntime + PsbDocument> convenience layer   │
+│  texture   RGBA4444 / 32-bpp spec order / RL / PNG decode        │
+│  plan      sprite scene -> textured triangle draw list           │
+│  soft      deterministic CPU rasterizer (blends, clip, masks)    │
+│  yuris     EMOTE/EMOTEINFO, capability, suspend, dirty           │
+│  bins      psb-info, psb-dump, psb-key-search, render, anim      │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-Dependency direction is top-down only. `yuris` may depend on `model`/`anim`,
-but the core never depends on YU-RIS concepts. The kernel consumes the adapter
-through domain events; it does not link the renderer into `yu-gfx`.
+`plan`/`soft` never re-evaluate animation. They consume the sprite list,
+world transforms, mesh patches and `DrawFrameInfo` produced by eluna, so the
+runtime semantics (transitions, loops, joins, physics) are shared with the
+reference implementation.
 
 ## YU-RIS glue: suspension and optimization
 
 YU-RIS has its own task scheduler and redraw policy. The adapter exposes:
 
-- `Capability` → mirrored to `SYSTEMINFO[EMOTE]`; keep `Unavailable`/`DataOnly`
-  until a renderer is ready so scripts do not take the E-mote branch.
+- `Capability` → mirrored to `SYSTEMINFO[EMOTE]`; `Ready` when the runtime and
+  renderer are linked, `DataOnly` for inspection-only hosts.
 - `suspend()` / `resume()`: freezes the deterministic clock. A suspended
   character keeps its last pose (engine behavior per the ERIS manual).
 - `tick(dt_ms) -> bool` and `take_dirty()`: the host can skip E-mote work and
   re-compositing when nothing changed.
 - Parameter recording by name; unknown names are retained, never coerced.
 
-This is deliberately not in the data core: other engines/hosts can drive the
-same core with their own scheduler.
+This stays outside the runtime: other hosts can drive `EmoteRuntime` with
+their own scheduler.
 
 ## PSB body encryption
 
 YU-RIS E-mote files often have a clean header (`flags == 0`) but an encrypted
-value body; the root tag at `entrypoint` is not `0x21`. The body range
-`[name_offset, resource_offset)` is XORed with the documented 6-word stream
-(`0x075BCD15, 0x159A55E5, 0x1F123BB5, key, 0, 0`). `yu-emote` exposes this as
-`read_document_with_key(path, Some(key))` and ships `psb-key-search` for the
-single-DWORD key space. The key is **per game** and is never hardcoded in the
-library; tests read it from `YURIS_EMOTE_KEY`.
+value body. `PsbDocument::from_bytes(bytes, key)` passes an explicit
+`PsbDecryptionKey::emote_key(key)` to the vendored parser. `psb-key-search`
+covers the single-DWORD key space. The key is **per game** and is never
+hardcoded in the library; tests read it from `YURIS_EMOTE_KEY`.
 
-## wasm strategy
+## Rendering
 
-- Data layer: pure Rust; `emote-psb` uses only memory/IO abstractions and is
-  expected to compile for `wasm32-unknown-unknown`. (Verified at the crate
-  level by the upstream project; this repository will add a wasm CI target.)
-- Renderer: wgpu/WebGPU, matching the kernel's browser backend. A WebGL2
-  fallback, if needed for older browsers, is a separate backend.
-- The official `YSEmote.dll`/`emotedriver.dll` are Win32 x86 + D3D9 and cannot
-  be used in wasm. They serve as pixel/behavior oracles only.
+`plan` reproduces the reference `eluna_player` vertex contract:
+
+- rectangle → center-relative scale → rotation → world transform;
+- 4x4 Bezier patch sampling for `mesh.bp`;
+- four corner colors in `0xRRGGBBAA` order with alpha × layer opacity;
+- native emission order (`DrawFrameInfo`).
+
+`soft` rasterizes with barycentric coverage and bilinear sampling, then applies
+the native texture stage (MODULATE2X, modes 3/4 premultiply, mode 5
+complement), the D3D9 blend table (`sub_1041A190`), type-7 clip rectangles and
+type-12 wipe. Inner stencil owners are resolved from eluna's structural
+`native_draw_key` chain and rasterized into union coverage buffers. Outer
+stencil phases, feedback history and particles are reported as skipped.
+
+## Stack size
+
+eluna scene evaluation is recursive (nested motions, mesh chains). Debug builds
+need a large stack; `.cargo/config.toml` sets a 32 MiB main-thread stack for
+`x86_64-pc-windows-msvc` and `RUST_MIN_STACK=33554432` for tests. Library
+consumers on other targets should run the runtime on a thread with a comparable
+stack.
 
 ## Evidence rules
 
 1. Official engine behavior / official DLL output (oracle).
 2. Official data (`emote_test.psb`) and the SDK manual.
-3. Public tooling behavior (`emote-psb`, `amadeus-emote-loader`, FreeMote,
-   `eluna`) as the primary behavioral reference. eluna is MPL-2.0; see
-   `NOTICE` for the adapted modules.
+3. Reference implementations: `eluna` (vendored runtime), `eluna_player`
+   (renderer math), FreeMote/NekoWebShow/KrKr2-Next as behavioral references.
 4. No evidence → explicit `Unsupported`/`NotReady`, never a guessed value.
 
 ## Milestones
 
-- **M1 (data extraction done)** typed PSB schema (`schema`), `RGBA4444`
-  (v2 multi-page) and `RGBA8` (v4 `ems` single-page) atlas decoding
-  (`texture`), deterministic `psb-dump`, sample-backed tests. Part
-  visibility / normalization rules still need evidence. The source layout and
-  filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
-  behavior references; no code was copied.
-- **M2 (core done)** `Animator` mirrors the native timeline runtime rather
-  than sampling keyframes as curves: crossing a frame boundary issues a
-  variable command, the next frame supplies the transition duration
-  (`next.time - crossing_time - 1`) and easing exponent, type-0 frames are
-  cursor-only, and authored loops advance to `loopEnd` non-inclusively and
-  seek `loopBegin`. The official tick rate is 60 Hz (`EMOTE_TICKS_PER_SECOND`). The nested-motion recursion limit is 256 so deep eye-highlight chains are not truncated. Type-1/5 physics anchors use the native mesh-chain position warp, not the un-warped world origin.
-  `pose` handles type 0/3 frames, `ti`, the top-level easing table and
-  `ccc/acc/zcc/scc/occ/wcc` channel curves, `cp` Bezier motion paths,
-  channel-wise `inheritMask`, `transformOrder`, nested type-3 motions,
-  motion-local `parameter` tables, motion-level `parameterize`, and resolved-Z
-  draw order. An omitted/empty `mesh.bp` decodes to the identity patch (this
-  is required for smooth parameterized hair deformations at authored
-  midpoints). `meshSyncChildMask` 0x1/0x2/0x4, `meshCombinator`, native
-  multi-source inheritance and motion-root compensation are implemented.
-  `physics` runs bust and two-segment hair/parts springs;
-  `control` runs clamp and automatic eye blink; `Player` advances timeline →
-  controllers → pose → physics in the native order with deterministic
-  60 Hz ticks. Type-7 clip rectangles are propagated and applied by the CPU
-  rasterizer. `psb-anim` renders a whole timeline to a PNG sequence for the
-  demo video. Remaining M2 work: type-9 anchors, particle/feedback passes,
-  selector/mouth graph queues, wind, and the exact differential fade curve.
-- **M3 (baseline done)** all 58 official shader variants are committed as WGSL
-  files under `shaders/`; `plan` turns a pose into textured mesh draw items and
-  `soft` rasterizes it deterministically for validation/PNG output. Composite
-  alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`) are resolved
-  per motion scope (type-3 sources expand to their nested player's sprites) and
-  rasterized into coverage buffers. The native blend table (`sub_1041A190`,
-  modes 0..5) and MODULATE2X are applied per pixel. The wgpu pipeline,
-  type-7 clip rectangles are applied per item, and `psb-anim` feeds the
-  WebM demo clips. The wgpu pipeline, pixelate pass, inner/outer stencil
-  phases, and the runtime's shader-variant selection rules remain.
-- **M4** parity: official DLL screenshots vs. this renderer; per-channel
-  thresholds declared before measurement.
+- **M1 (done)** PSB v2/v4 data, `RGBA4444`/`RGBA8`/RL textures, per-game key,
+  deterministic dumps, YU-RIS adapter.
+- **M2 (done via eluna)** timeline command streams, transitions/easing,
+  authored loops, DPLAY, nested motions, mesh chain, anchors, clips, joins,
+  physics, clamp/eye/selectors. `psb-anim` starts authored loops at `loopBegin`
+  and can settle complete loops before recording.
+- **M3 (renderer bridge done)** scene → draw plan, native blends, MODULATE2X,
+  clip, wipe, inner masks, PNG/WebM output. Static-frame parity against
+  `eluna_player` is ~0.3/255 mean absolute RGB error (edge/gamma only).
+  Outstanding: outer stencil reference counting, particles, feedback,
+  stereovision, wgpu delivery.
+- **M4** parity against official `YSEmote.dll` screenshots with declared
+  per-channel thresholds.
 
 ## Licensing
 
-MIT OR Apache-2.0 for the project as a whole. Third-party attributions are in
-`NOTICE`. The runtime modules listed there adapt algorithms and native
-constants from `eluna` (MPL-2.0), and remain available under MPL-2.0; the
-canonical MPL text is in `LICENSE-MPL-2.0`. FreeMote (CC BY-NC-SA) is used as
-a visual/format oracle only and is not a dependency.
+The project as a whole is MIT OR Apache-2.0. `vendor/eluna` is MPL-2.0 and is
+kept with its source, license and `PROVENANCE.md`. `src/plan.rs`,
+`src/soft.rs` and `src/texture.rs` adapt renderer math from `eluna_player`
+(MIT OR Apache-2.0); see `NOTICE`. FreeMote (CC BY-NC-SA) and NekoWebShow
+(AGPL-3.0) / KrKr2-Next (GPL-3.0) are references only, not dependencies.
