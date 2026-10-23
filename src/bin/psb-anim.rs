@@ -44,6 +44,8 @@ fn main() -> ExitCode {
     let mut settle = 0usize;
     let mut margin = 20.0f32;
     let mut loop_timeline = true;
+    let mut controls_enabled = true;
+    let mut physics_enabled = true;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--key" => match args.next().as_deref().map(parse_key) {
@@ -79,6 +81,8 @@ fn main() -> ExitCode {
                 }
             },
             "--no-loop" => loop_timeline = false,
+            "--no-controls" => controls_enabled = false,
+            "--no-physics" => physics_enabled = false,
             "--settle" => match args.next().map(|value| value.parse::<usize>()) {
                 Some(Ok(value)) => settle = value,
                 _ => {
@@ -170,6 +174,8 @@ fn main() -> ExitCode {
         .unwrap_or_default();
 
     let mut player = Player::new(&model, &object, &motion, 60.0);
+    player.controls_enabled = controls_enabled;
+    player.physics_enabled = physics_enabled;
     for (name, value) in &variables {
         player.set_variable(name.clone(), *value);
     }
