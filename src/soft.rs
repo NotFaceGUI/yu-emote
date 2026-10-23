@@ -212,7 +212,15 @@ pub fn render_with_textures(
                     continue;
                 };
                 rasterize_triangle_coverage(
-                    &mut buffer, width, height, texture, v0, v1, v2, view, clip,
+                    &mut buffer,
+                    width,
+                    height,
+                    texture,
+                    v0,
+                    v1,
+                    v2,
+                    view,
+                    clip,
                 );
             }
         }

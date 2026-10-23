@@ -175,8 +175,7 @@ fn write_png(path: &str, image: &soft::RenderImage) -> Result<(), Box<dyn std::e
 }
 
 fn need(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{option} needs a value"))
+    args.next().ok_or_else(|| format!("{option} needs a value"))
 }
 
 fn parse_key(raw: &str) -> Result<u32, String> {

@@ -134,8 +134,7 @@ fn spec_of(root: &ValueTree) -> Option<String> {
 }
 
 fn need(args: &mut impl Iterator<Item = String>, option: &str) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{option} needs a value"))
+    args.next().ok_or_else(|| format!("{option} needs a value"))
 }
 
 fn parse_key(raw: &str) -> Result<u32, String> {

@@ -188,12 +188,12 @@ pub fn decode_resource(
     height: u32,
     spec: Option<&str>,
 ) -> Result<DecodedTexture, EmoteError> {
-    let bytes = psb
-        .resource_bytes(data, index as usize)
-        .ok_or_else(|| EmoteError::TextureResourceMissing {
+    let bytes = psb.resource_bytes(data, index as usize).ok_or_else(|| {
+        EmoteError::TextureResourceMissing {
             page: format!("resource#{index}"),
             index: Some(index as usize),
-        })?;
+        }
+    })?;
     let source = EmoteTextureSource {
         name: format!("resource#{index}"),
         resource_index: index,
@@ -215,11 +215,12 @@ fn decode_png(bytes: &[u8]) -> Result<DecodedTexture, EmoteError> {
             format: "png".to_owned(),
         })?;
     let mut buffer = vec![0; reader.output_buffer_size()];
-    let info = reader
-        .next_frame(&mut buffer)
-        .map_err(|_| EmoteError::UnsupportedTextureFormat {
-            format: "png".to_owned(),
-        })?;
+    let info =
+        reader
+            .next_frame(&mut buffer)
+            .map_err(|_| EmoteError::UnsupportedTextureFormat {
+                format: "png".to_owned(),
+            })?;
     let rgba8 = match info.color_type {
         png::ColorType::Rgba => buffer[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => {
@@ -307,32 +308,34 @@ fn decompress_rl(bytes: &[u8], align: usize, expected: usize) -> Result<Vec<u8>,
         pos += 1;
         if (command & 0x80) != 0 {
             let count = ((command ^ 0x80) as usize) + 3;
-            let end = pos
-                .checked_add(align)
-                .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
-                    format: "RL/overflow".to_owned(),
-                })?;
-            let pattern = bytes.get(pos..end).ok_or_else(|| {
-                EmoteError::UnsupportedTextureFormat {
-                    format: "RL/truncated".to_owned(),
-                }
-            })?;
+            let end =
+                pos.checked_add(align)
+                    .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
+                        format: "RL/overflow".to_owned(),
+                    })?;
+            let pattern =
+                bytes
+                    .get(pos..end)
+                    .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
+                        format: "RL/truncated".to_owned(),
+                    })?;
             for _ in 0..count {
                 out.extend_from_slice(pattern);
             }
             pos = end;
         } else {
             let count = ((command as usize) + 1) * align;
-            let end = pos
-                .checked_add(count)
-                .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
-                    format: "RL/overflow".to_owned(),
-                })?;
-            let block = bytes.get(pos..end).ok_or_else(|| {
-                EmoteError::UnsupportedTextureFormat {
-                    format: "RL/truncated".to_owned(),
-                }
-            })?;
+            let end =
+                pos.checked_add(count)
+                    .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
+                        format: "RL/overflow".to_owned(),
+                    })?;
+            let block =
+                bytes
+                    .get(pos..end)
+                    .ok_or_else(|| EmoteError::UnsupportedTextureFormat {
+                        format: "RL/truncated".to_owned(),
+                    })?;
             out.extend_from_slice(block);
             pos = end;
         }
@@ -366,7 +369,10 @@ mod tests {
 
     #[test]
     fn ems_spec_keeps_rgba_order() {
-        assert_eq!(channel_order(Some("RGBA8"), Some("ems")), ChannelOrder::Rgba);
+        assert_eq!(
+            channel_order(Some("RGBA8"), Some("ems")),
+            ChannelOrder::Rgba
+        );
         assert_eq!(channel_order(Some("RGBA8"), None), ChannelOrder::Bgra);
     }
 

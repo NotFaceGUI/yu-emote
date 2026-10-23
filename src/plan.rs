@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use eluna::{EmoteDrawFrameInfo, EmoteDrawPass, EmoteMeshPatch, EmoteStaticScene, EmoteStaticSprite};
+use eluna::{
+    EmoteDrawFrameInfo, EmoteDrawPass, EmoteMeshPatch, EmoteStaticScene, EmoteStaticSprite,
+};
 
 /// One vertex in model/pixel space.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]

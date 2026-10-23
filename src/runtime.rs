@@ -118,11 +118,7 @@ impl Emote {
     }
 
     /// Start a timeline.
-    pub fn play_timeline(
-        &mut self,
-        name: &str,
-        mode: TimelinePlayMode,
-    ) -> Result<(), EmoteError> {
+    pub fn play_timeline(&mut self, name: &str, mode: TimelinePlayMode) -> Result<(), EmoteError> {
         if !self.runtime.timeline_names().contains(&name) {
             return Err(EmoteError::UnknownTimeline(name.to_owned()));
         }
