@@ -383,6 +383,7 @@ mod tests {
             mask_group: None,
             scope: 0,
             mesh: None,
+            mesh_chain: Vec::new(),
             priority_path: Vec::new(),
             children: Vec::new(),
         };

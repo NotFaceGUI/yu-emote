@@ -195,9 +195,38 @@ def main() -> int:
         else:
             anim_frames = anim_frames[:expected_frames]
 
+        # A short one-shot gesture (挨拶) proves timeline transitions beyond
+        # the subtle idle loop. It is cached separately from the idle clip.
+        gesture_dir = OUT / "frames" / f"{stem}-gesture"
+        gesture_webm = OUT / "frames" / f"{stem}-gesture.webm"
+        gesture_count = 45
+        gesture_frames = sorted(gesture_dir.glob("frame-*.png")) if gesture_dir.exists() else []
+        if args.force or len(gesture_frames) < gesture_count:
+            run_anim(
+                path,
+                args.key,
+                [
+                    "--timeline",
+                    "挨拶",
+                    "--fps",
+                    "30",
+                    "--seconds",
+                    "1.5",
+                    "--no-loop",
+                    *fixed,
+                ],
+                gesture_dir,
+            )
+            gesture_frames = sorted(gesture_dir.glob("frame-*.png")) if gesture_dir.exists() else []
+        else:
+            gesture_frames = gesture_frames[:gesture_count]
+
         stills = [frame[3] for frame in rendered]
         if anim_frames:
             stills.append(Image.open(anim_frames[0]).convert("RGBA"))
+        if gesture_frames:
+            stills.append(Image.open(gesture_frames[0]).convert("RGBA"))
+            stills.append(Image.open(gesture_frames[-1]).convert("RGBA"))
         box = trim_union(stills)
         height = min(args.max_height, box[3] - box[1])
         width = max(1, round((box[2] - box[0]) * height / (box[3] - box[1])))
@@ -222,6 +251,23 @@ def main() -> int:
                 + base64.b64encode(webm_path.read_bytes()).decode("ascii")
             )
 
+        gesture = None
+        if gesture_frames and (args.force or not gesture_webm.exists()):
+            encoded = encode_video(
+                gesture_frames,
+                box,
+                (width, height),
+                gesture_webm,
+                30,
+            )
+            if encoded:
+                gesture = f"data:video/webm;base64,{encoded}"
+        elif gesture_frames and gesture_webm.exists():
+            gesture = (
+                "data:video/webm;base64,"
+                + base64.b64encode(gesture_webm.read_bytes()).decode("ascii")
+            )
+
         models.append(
             {
                 "label": label,
@@ -231,6 +277,7 @@ def main() -> int:
                     for pid, _, _, image, _ in rendered
                 },
                 "video": video,
+                "gesture": gesture,
                 "poseMeta": [
                     {"id": pid, "label": plabel, "accent": accent}
                     for pid, plabel, accent, _, _ in rendered
@@ -398,6 +445,12 @@ liveButton.style.setProperty('--pill', '#64b5a0');
 liveButton.addEventListener('click', () => startLive());
 posesEl.appendChild(liveButton);
 
+const gestureButton = document.createElement('button');
+gestureButton.textContent = '▶ しぐさ（挨拶）';
+gestureButton.style.setProperty('--pill', '#d7a35a');
+gestureButton.addEventListener('click', () => startClip('gesture'));
+posesEl.appendChild(gestureButton);
+
 function updateStats(model) {{
   const stats = model.stats?.stats;
   if (!stats) return;
@@ -439,9 +492,14 @@ function select(modelIndex, poseIndex) {{
 }}
 
 function startLive() {{
+  startClip('idle');
+}}
+
+function startClip(kind) {{
   const model = MODELS[mi];
-  if (!model.video) {{
-    varsEl.textContent = 'このモデルには待機ループがありません';
+  const source = kind === 'gesture' ? model.gesture : model.video;
+  if (!source) {{
+    varsEl.textContent = 'このモデルにはクリップがありません';
     return;
   }}
   stopLive();
@@ -452,19 +510,23 @@ function startLive() {{
   view.style.display = 'none';
   viewNext.style.display = 'none';
   animEl.style.display = 'block';
-  animEl.src = model.video;
+  animEl.loop = kind === 'idle';
+  animEl.src = source;
   animEl.currentTime = 0;
   animEl.play().catch(() => {{
     animEl.addEventListener('canplay', () => animEl.play().catch(() => {{}}), {{ once: true }});
   }});
-  nameEl.textContent = model.label + ' · 待機ループ';
-  varsEl.textContent = 'timeline: 待機ループ00 · 60Hz engine / 30fps preview';
+  nameEl.textContent = model.label + (kind === 'gesture' ? ' · 挨拶' : ' · 待機ループ');
+  varsEl.textContent = kind === 'gesture'
+    ? 'timeline: 挨拶 · one-shot'
+    : 'timeline: 待機ループ00 · 60Hz engine / 30fps preview';
   updateStats(model);
 }}
 
 function stopLive() {{
   playing = false;
   animEl.pause();
+  animEl.loop = true;
   animEl.style.display = 'none';
   view.style.display = 'block';
   viewNext.style.display = 'block';

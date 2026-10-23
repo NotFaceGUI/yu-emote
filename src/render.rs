@@ -526,6 +526,26 @@ impl MeshPatch {
         self
     }
 
+    /// Warp one point through the patch in its authored domain.
+    ///
+    /// The input and output are in the owning layer's local sprite pixels;
+    /// points outside `[0,1]` are evaluated without clamping, matching native
+    /// `meshSyncChild` finite differences at patch edges.
+    pub fn warp_local(&self, point: [f32; 2]) -> Option<[f32; 2]> {
+        let [left, top, width, height] = self.domain?;
+        if !width.is_finite()
+            || !height.is_finite()
+            || width.abs() <= f32::EPSILON
+            || height.abs() <= f32::EPSILON
+        {
+            return None;
+        }
+        let u = (point[0] - left) / width;
+        let v = (point[1] - top) / height;
+        let mapped = self.sample(u, v);
+        Some([left + mapped[0] * width, top + mapped[1] * height])
+    }
+
     /// Attach the mesh-sync domain when the patch does not carry one.
     pub fn with_domain(mut self, domain: Option<[f32; 4]>) -> Self {
         if self.domain.is_none() {

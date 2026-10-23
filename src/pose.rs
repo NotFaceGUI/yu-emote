@@ -43,7 +43,7 @@ const INHERIT_LINEAR_ALL: i64 = 0x1FC;
 /// Opacity inheritance bit.
 const INHERIT_OPACITY: i64 = 0x400;
 /// Recursion guard for type-3 nested motions.
-const MAX_NESTED_MOTION_DEPTH: usize = 32;
+const MAX_NESTED_MOTION_DEPTH: usize = 256;
 
 /// Decoded state of one layer at a given time.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1001,6 +1001,19 @@ fn remove_motion_root_linear_state(
     state
 }
 
+/// One ancestor shape-sync patch with its world frame.
+///
+/// Native `StepFrameMeshChain` stores a patch and the owning layer transform;
+/// type-1/type-5 layer positions are warped through this chain. Physics anchors
+/// read the resulting position, not the un-warped world origin.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MeshChainEntry {
+    /// Patch in the owning layer's local sprite pixels.
+    pub patch: MeshPatch,
+    /// Owning layer world transform.
+    pub world: Affine2,
+}
+
 /// One layer in the evaluated pose.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LayerPose {
@@ -1052,6 +1065,9 @@ pub struct LayerPose {
     /// (`sub_1038B340`). The patch is normalized to the drawn sprite's icon
     /// box; it is not a world-space warp.
     pub mesh: Option<MeshPatch>,
+    /// Ancestor shape-sync mesh chain used to warp type-1/5 positions.
+    #[serde(skip)]
+    pub mesh_chain: Vec<MeshChainEntry>,
     /// Draw-order key: rank path from `priority` frames.
     pub priority_path: Vec<i64>,
     /// Child layers.
@@ -1130,6 +1146,7 @@ impl Pose {
             motion_root: InheritSource::root(),
             motion_independent: false,
             clip: None,
+            mesh_chain: Vec::new(),
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
@@ -1178,7 +1195,26 @@ impl Pose {
         fn find(layers: &[LayerPose], label: &str) -> Option<[f64; 3]> {
             for layer in layers {
                 if layer.label == label {
-                    return Some(layer.world_origin);
+                    let mut position = layer.world_origin;
+                    if matches!(layer.kind, 1 | 5) {
+                        let mut xy = [position[0] as f32, position[1] as f32];
+                        for entry in layer.mesh_chain.iter().rev() {
+                            let Some(inverse) = entry.world.inverse() else {
+                                continue;
+                            };
+                            let local = inverse.apply([xy[0] as f64, xy[1] as f64]);
+                            let Some(warped) =
+                                entry.patch.warp_local([local[0] as f32, local[1] as f32])
+                            else {
+                                continue;
+                            };
+                            let world = entry.world.apply([warped[0] as f64, warped[1] as f64]);
+                            xy = [world[0] as f32, world[1] as f32];
+                        }
+                        position[0] = xy[0] as f64;
+                        position[1] = xy[1] as f64;
+                    }
+                    return Some(position);
                 }
                 if let Some(position) = find(&layer.children, label) {
                     return Some(position);
@@ -1269,6 +1305,8 @@ struct Context {
     motion_independent: bool,
     /// Type-7 clip rectangle inherited from ancestors.
     clip: Option<[f64; 4]>,
+    /// Ancestor shape-sync chain.
+    mesh_chain: Vec<MeshChainEntry>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1428,6 +1466,13 @@ fn evaluate_layer(
         parent.mesh
     };
 
+    let mut child_chain = parent.mesh_chain.clone();
+    if shape_sync {
+        if let Some(patch) = own_mesh.filter(|patch| patch.domain.is_some()) {
+            child_chain.push(MeshChainEntry { patch, world });
+        }
+    }
+
     let current_coordinate = layer.coordinate.unwrap_or(0);
     // A layer with inheritMask bit 0x400000 is transparent: descendants keep
     // the source that this layer itself inherited from.
@@ -1470,6 +1515,7 @@ fn evaluate_layer(
         motion_root: parent.motion_root,
         motion_independent: parent.motion_independent,
         clip: clip_rect,
+        mesh_chain: child_chain,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -1595,6 +1641,7 @@ fn evaluate_layer(
         mask_group: inherited_mask_group,
         scope,
         mesh: self_mesh,
+        mesh_chain: parent.mesh_chain.clone(),
         priority_path,
         children,
     }
@@ -2051,6 +2098,36 @@ mod tests {
     }
 
     #[test]
+    fn mesh_chain_warps_type1_layer_position() {
+        let mut patch = MeshPatch::identity();
+        patch.domain = Some([-830.0, -900.0, 1660.0, 1800.0]);
+        for point in &mut patch.control_points {
+            point[1] += 0.005;
+        }
+        let mut layer = drawable_layer("center_fronthair", 0.0, &[]);
+        layer.kind = 1;
+        layer.world_origin = [6.0, -406.0, 0.0];
+        layer.mesh_chain = vec![MeshChainEntry {
+            patch,
+            world: Affine2 {
+                tx: 7.0,
+                ty: 144.0,
+                ..Affine2::identity()
+            },
+        }];
+        let pose = Pose {
+            object: String::new(),
+            motion: String::new(),
+            time: 0.0,
+            variables: BTreeMap::new(),
+            mask_groups: Vec::new(),
+            layers: vec![layer],
+        };
+        let position = pose.layer_position(Some("center_fronthair")).unwrap();
+        assert!((position[1] + 397.0).abs() < 0.5, "{position:?}");
+    }
+
+    #[test]
     fn type_zero_frame_holds_preceding_content() {
         let frames = [
             Frame {
@@ -2097,6 +2174,7 @@ mod tests {
             mask_group: None,
             scope: 0,
             mesh: None,
+            mesh_chain: Vec::new(),
             priority_path: priority_path.to_vec(),
             children: Vec::new(),
         }

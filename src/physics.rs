@@ -601,6 +601,48 @@ mod tests {
     }
 
     #[test]
+    fn pendulum_gravity_moves_output_after_four_ticks() {
+        let mut control = PendPhysics {
+            label: "hair".into(),
+            enabled: true,
+            base_layer: None,
+            length: [64.0, 48.0],
+            gravity: 0.2,
+            friction_x: 0.0625,
+            friction_y: 0.0625,
+            b_rate: 0.0037109375,
+            v_bound: 2.0,
+            bend_spd: 0.09817477,
+            bend_vol: 4.0,
+            ud_eft: 0,
+            ofs: -53.8947678,
+            scale_x: [0.75, 0.25],
+            scale_y: [2.0, 3.0],
+            root_offset: [0.0; 3],
+            bob: [[0.0, 117.894661, 0.0], [0.0, 165.99144, 0.0]],
+            vel: [[0.0; 3]; 2],
+            bend_phase: 0.0,
+            bend_power: 0.0,
+            first_tick: true,
+            last_anchor: None,
+            var_lr: Some("hair_LR".into()),
+            var_lrm: Some("hair_LR_M".into()),
+            var_ud: Some("hair_UD".into()),
+        };
+        let mut variables = BTreeMap::new();
+        let anchors = [
+            [6.0, -406.0, 25.0],
+            [6.1, -407.0, 25.0],
+            [6.15, -408.0, 25.0],
+            [6.18, -409.0, 25.0],
+        ];
+        for anchor in anchors {
+            control.step(1.0, anchor, 0.0, &mut variables);
+        }
+        assert!(variables["hair_UD"].abs() > 0.1, "{:?}", variables);
+    }
+
+    #[test]
     fn pendulum_first_tick_attaches_to_anchor_without_jump() {
         let mut control = PendPhysics {
             label: "hair".into(),

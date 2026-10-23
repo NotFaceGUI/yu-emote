@@ -79,7 +79,7 @@ Also verified against four Nekopara maid models (`chocola`, `vanilla`,
 `azuki`, `coconut`) mirrored by
 [`Chocola-X/NekoWebShow`](https://github.com/Chocola-X/NekoWebShow): PSB **v4**
 (`spec: ems`), one 4096x4096 `RGBA8` atlas under `source/tex`, 87 icons,
-21 objects / 48 motions, 34 draw items / 25,472 triangles at the base motion.
+21 objects / 48 motions, 36 draw items / 28,512 triangles at the base motion (including the two eye-highlight sprites).
 The game assets are used locally for testing and are **not redistributed** in
 this repository or its demo output.
 

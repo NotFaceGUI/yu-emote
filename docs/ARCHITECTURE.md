@@ -99,7 +99,7 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   variable command, the next frame supplies the transition duration
   (`next.time - crossing_time - 1`) and easing exponent, type-0 frames are
   cursor-only, and authored loops advance to `loopEnd` non-inclusively and
-  seek `loopBegin`. The official tick rate is 60 Hz (`EMOTE_TICKS_PER_SECOND`).
+  seek `loopBegin`. The official tick rate is 60 Hz (`EMOTE_TICKS_PER_SECOND`). The nested-motion recursion limit is 256 so deep eye-highlight chains are not truncated. Type-1/5 physics anchors use the native mesh-chain position warp, not the un-warped world origin.
   `pose` handles type 0/3 frames, `ti`, the top-level easing table and
   `ccc/acc/zcc/scc/occ/wcc` channel curves, `cp` Bezier motion paths,
   channel-wise `inheritMask`, `transformOrder`, nested type-3 motions,

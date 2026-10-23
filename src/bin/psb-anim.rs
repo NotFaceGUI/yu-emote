@@ -43,6 +43,7 @@ fn main() -> ExitCode {
     let mut fixed_view: Option<soft::ViewTransform> = None;
     let mut settle = 0usize;
     let mut margin = 20.0f32;
+    let mut loop_timeline = true;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--key" => match args.next().as_deref().map(parse_key) {
@@ -77,6 +78,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--no-loop" => loop_timeline = false,
             "--settle" => match args.next().map(|value| value.parse::<usize>()) {
                 Some(Ok(value)) => settle = value,
                 _ => {
@@ -174,7 +176,7 @@ fn main() -> ExitCode {
     if settle > 0 {
         player.settle(&model, settle);
     }
-    if let Err(error) = player.play(&timeline, true) {
+    if let Err(error) = player.play(&timeline, loop_timeline) {
         eprintln!("timeline `{timeline}`: {error}");
         return ExitCode::FAILURE;
     }
