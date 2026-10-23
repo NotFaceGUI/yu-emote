@@ -52,6 +52,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fixed_view: Option<soft::ViewTransform> = None;
     let mut canvas = [900u32, 1400u32];
     let mut margin = 20.0f32;
+    let mut threads = 0usize;
     let mut fit = true;
     let mut output = None;
 
@@ -90,12 +91,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 canvas = [parse_num::<u32>(w)?.max(1), parse_num::<u32>(h)?.max(1)];
             }
             "--margin" => margin = parse_num(&need(&mut args, "--margin")?)?,
+            "--threads" => threads = parse_num::<usize>(&need(&mut args, "--threads")?)?,
             "--no-fit" => fit = false,
             "--out" => output = Some(need(&mut args, "--out")?),
             other => return Err(format!("unknown argument `{other}`").into()),
         }
     }
 
+    soft::set_thread_count(threads);
     let mut emote = Emote::load(&path, key, motion.as_deref())?;
     emote.set_variables(&variables)?;
 

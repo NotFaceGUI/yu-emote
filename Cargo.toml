@@ -41,5 +41,9 @@ path = "src/bin/psb-render.rs"
 name = "psb-anim"
 path = "src/bin/psb-anim.rs"
 
+[[bin]]
+name = "psb-bench"
+path = "src/bin/psb-bench.rs"
+
 [profile.release]
 lto = "thin"

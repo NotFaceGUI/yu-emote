@@ -61,6 +61,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut fixed_view: Option<soft::ViewTransform> = None;
     let mut canvas = [900u32, 1400u32];
     let mut margin = 20.0f32;
+    let mut threads = 0usize;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -112,6 +113,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 canvas = [parse_num::<u32>(w)?.max(1), parse_num::<u32>(h)?.max(1)];
             }
             "--margin" => margin = parse_num(&need(&mut args, "--margin")?)?,
+            "--threads" => threads = parse_num::<usize>(&need(&mut args, "--threads")?)?,
             other => return Err(format!("unknown argument `{other}`").into()),
         }
     }
@@ -120,6 +122,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = out_dir.ok_or("--out-dir is required")?;
     fs::create_dir_all(&out_dir)?;
 
+    soft::set_thread_count(threads);
     let mut emote = Emote::load(&path, key, motion.as_deref())?;
     emote.set_variables(&variables)?;
     if !physics {

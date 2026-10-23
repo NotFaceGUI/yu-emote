@@ -84,6 +84,21 @@ type-12 wipe. Inner stencil owners are resolved from eluna's structural
 `native_draw_key` chain and rasterized into union coverage buffers. Outer
 stencil phases, feedback history and particles are reported as skipped.
 
+## Performance
+
+`soft` splits the canvas into horizontal bands. Each worker owns its rows for
+the entire frame, so item/triangle order and per-pixel blending are unchanged;
+only pixel ownership changes. Triangle setup uses incremental edge functions
+and per-row absolute barycentric weights (required for byte-identical output
+across thread counts). Source-over has transparent/opaque fast paths, and the
+plan builds item vertices in parallel and caches model-space bounds.
+
+At 800×600 the measured frame is ~10–11 ms (tick ~7–8 ms, plan ~0.9 ms, raster
+~2–3 ms) on a 16-thread host, versus 24.7 ms for the pre-optimization
+single-thread path. The scene rebuild/physics tick is now the bottleneck and is
+single-threaded inside `eluna`; further gains require runtime-side caching, a
+pipeline that overlaps tick and raster, or a GPU offscreen pass.
+
 ## Stack size
 
 eluna scene evaluation is recursive (nested motions, mesh chains). Debug builds

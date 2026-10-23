@@ -39,7 +39,8 @@ and the single local PSB v4 parsing fix.
 | YU-RIS adapter: `EMOTE` params, `EMOTEINFO`, capability, suspend/dirty | ✅ |
 | Texture decode: `RGBA4444`, 32-bpp spec order, RL, PNG fallback | ✅ |
 | Draw plan + CPU rasterizer: native blends 0..5, MODULATE2X, clip, wipe, inner masks | ✅ |
-| CLI: info/dump/key search/render/timeline PNG sequence | ✅ |
+| Parallel CPU rasterizer (16 bands, incremental edges, deterministic across thread counts) | ✅ |
+| CLI: info/dump/key search/render/timeline PNG sequence/benchmark | ✅ |
 | Demo: 4 real models, expressions, 30 fps alpha-WebM idle loop + one-shot gesture | ✅ |
 | wgpu delivery pipeline | ⏳ |
 | Outer-stencil reference counting, type-4 particles, type-10 feedback, stereovision in the CPU renderer | ⏳ |
@@ -99,6 +100,40 @@ The page embeds expression stills, a 30 fps alpha-WebM idle loop (authored
 elements carry `autoplay muted loop playsinline`, and clip switches cross-fade.
 Game assets remain the property of their rights holders and are not
 redistributed.
+
+
+## Performance
+
+Measured on the four v4 maid models with `psb-bench` at the kernel viewport
+(800×600), 60 samples each, median of three runs on a 16-thread Windows host
+(other processes were running, so the absolute numbers are conservative):
+
+| Model | mean frame | p95 frame | implied fps | tick | plan | raster |
+|---|---:|---:|---:|---:|---:|---:|
+| Azuki | 10.0 ms | 12.9 ms | ~100 | 7.0 ms | 0.9 ms | 2.1 ms |
+| Chocola | 11.3 ms | 14.7 ms | ~88 | 7.8 ms | 0.9 ms | 2.6 ms |
+| Coconut | 10.7 ms | 12.7 ms | ~94 | 7.1 ms | 0.9 ms | 2.6 ms |
+| Vanilla | 11.2 ms | 14.7 ms | ~89 | 7.8 ms | 0.9 ms | 2.5 ms |
+
+The pre-optimization single-thread path measured 24.7 ms mean (~40 fps) on the
+same viewport, with 15.8 ms in the rasterizer. At the demo canvas (900×1400)
+the optimized path is 16.3 ms mean (~61 fps).
+
+What changed:
+
+- horizontal-band parallelism (one worker owns its rows for the whole frame,
+  so draw order is unchanged);
+- incremental edge/barycentric setup instead of three edge functions and a
+  divide per pixel;
+- per-row absolute weights (not accumulated from the band start), which makes
+  the output **byte-identical for 1 and 16 threads**;
+- source-over fast paths for transparent/opaque destinations and direct texel
+  reads instead of per-pixel bounds-checked accessors;
+- parallel draw-item vertex generation and cached model-space item bounds.
+
+Remaining ceiling: `eluna`'s scene rebuild/physics runs on one thread and costs
+~7–8 ms per 60 Hz tick; rasterization is now a minority of the frame. Further
+gains need runtime-side caching or a GPU offscreen pass.
 
 ## Verified data
 

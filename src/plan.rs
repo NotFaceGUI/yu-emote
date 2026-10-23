@@ -70,6 +70,8 @@ pub struct DrawItem {
     pub vertices: Vec<PlanVertex>,
     /// Triangle indices.
     pub indices: Vec<u32>,
+    /// Model-space vertex bounds (`min`, `max`), if any.
+    pub bounds: Option<([f32; 2], [f32; 2])>,
 }
 
 /// Coverage sources for one inner stencil owner.
@@ -122,7 +124,7 @@ impl RenderPlan {
             })
             .collect();
 
-        let mut items: Vec<DrawItem> = visible.iter().map(|sprite| build_item(sprite)).collect();
+        let mut items = build_items(&visible);
 
         let mut key_to_item = BTreeMap::<Vec<u64>, usize>::new();
         for (index, sprite) in visible.iter().enumerate() {
@@ -210,12 +212,12 @@ impl RenderPlan {
             ) {
                 continue;
             }
-            for vertex in &item.vertices {
+            if let Some((item_min, item_max)) = item.bounds {
                 any = true;
-                min[0] = min[0].min(vertex.position[0]);
-                min[1] = min[1].min(vertex.position[1]);
-                max[0] = max[0].max(vertex.position[0]);
-                max[1] = max[1].max(vertex.position[1]);
+                min[0] = min[0].min(item_min[0]);
+                min[1] = min[1].min(item_min[1]);
+                max[0] = max[0].max(item_max[0]);
+                max[1] = max[1].max(item_max[1]);
             }
         }
         any.then_some((min, max))
@@ -237,14 +239,6 @@ impl RenderPlan {
             .items
             .iter()
             .map(|item| {
-                let mut min = [f32::INFINITY; 2];
-                let mut max = [f32::NEG_INFINITY; 2];
-                for vertex in &item.vertices {
-                    min[0] = min[0].min(vertex.position[0]);
-                    min[1] = min[1].min(vertex.position[1]);
-                    max[0] = max[0].max(vertex.position[0]);
-                    max[1] = max[1].max(vertex.position[1]);
-                }
                 serde_json::json!({
                     "label": item.label,
                     "path": item.path,
@@ -258,7 +252,7 @@ impl RenderPlan {
                     "stencil_type": item.stencil_type,
                     "pass": format!("{:?}", item.pass),
                     "masks": item.mask_groups.len(),
-                    "bbox": if item.vertices.is_empty() { None } else { Some([min, max]) },
+                    "bbox": item.bounds.map(|(min, max)| [min, max]),
                 })
             })
             .collect();
@@ -272,6 +266,32 @@ impl RenderPlan {
             "triangle_count": self.triangle_count(),
         })
     }
+}
+
+fn build_items(visible: &[&EmoteStaticSprite]) -> Vec<DrawItem> {
+    let workers = std::thread::available_parallelism()
+        .map(|count| count.get().clamp(1, 4))
+        .unwrap_or(1);
+    if workers <= 1 || visible.len() < 8 {
+        return visible.iter().map(|sprite| build_item(sprite)).collect();
+    }
+    let chunk = visible.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for slice in visible.chunks(chunk) {
+            handles.push(scope.spawn(move || {
+                slice
+                    .iter()
+                    .map(|sprite| build_item(sprite))
+                    .collect::<Vec<_>>()
+            }));
+        }
+        let mut items = Vec::with_capacity(visible.len());
+        for handle in handles {
+            items.extend(handle.join().expect("plan worker"));
+        }
+        items
+    })
 }
 
 fn build_item(sprite: &EmoteStaticSprite) -> DrawItem {
@@ -307,9 +327,22 @@ fn build_item(sprite: &EmoteStaticSprite) -> DrawItem {
             sprite.draw_frame_info.stencil_wipe_scale,
             sprite.draw_frame_info.stencil_wipe_bias,
         ],
+        bounds: vertex_bounds(&vertices),
         vertices,
         indices,
     }
+}
+
+fn vertex_bounds(vertices: &[PlanVertex]) -> Option<([f32; 2], [f32; 2])> {
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for vertex in vertices {
+        min[0] = min[0].min(vertex.position[0]);
+        min[1] = min[1].min(vertex.position[1]);
+        max[0] = max[0].max(vertex.position[0]);
+        max[1] = max[1].max(vertex.position[1]);
+    }
+    min[0].is_finite().then_some((min, max))
 }
 
 fn sprite_vertices(sprite: &EmoteStaticSprite) -> (Vec<PlanVertex>, Vec<u32>, u32) {
