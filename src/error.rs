@@ -73,6 +73,10 @@ pub enum EmoteError {
         height: u32,
     },
 
+    /// The GPU renderer could not be created or read back.
+    #[error("GPU: {0}")]
+    Gpu(String),
+
     /// A parameter was used with a type the adapter does not understand.
     #[error("unsupported type for E-mote parameter `{name}`")]
     UnsupportedParameterType {

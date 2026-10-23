@@ -47,6 +47,7 @@
 #![warn(missing_docs)]
 
 pub mod error;
+pub mod gpu;
 pub mod plan;
 pub mod psb;
 pub mod runtime;
@@ -56,6 +57,7 @@ pub mod yuris;
 
 pub use eluna;
 pub use error::EmoteError;
+pub use gpu::{GpuFrame, GpuRenderer, GpuStats};
 pub use plan::{DrawItem, MaskGroup, PlanVertex, RenderPlan};
 pub use psb::{PsbDocument, PsbFile, PsbValue};
 pub use runtime::{

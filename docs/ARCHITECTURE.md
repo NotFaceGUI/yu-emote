@@ -99,6 +99,29 @@ single-thread path. The scene rebuild/physics tick is now the bottleneck and is
 single-threaded inside `eluna`; further gains require runtime-side caching, a
 pipeline that overlaps tick and raster, or a GPU offscreen pass.
 
+## wgpu backend
+
+`gpu.rs` renders the same `RenderPlan` with the kernel's target format
+(`Rgba8Unorm`, no sRGB conversion) and can share the kernel's
+`wgpu::Device`/`wgpu::Queue` through `GpuRenderer::new`. Each frame produces a
+fresh `TextureView` over a cached target texture; the kernel can bind it as a
+normal texture and composite it with its own layer transform (the M0
+"RGBA texture + layer transform" decision).
+
+- one vertex/index buffer per frame, one indexed draw per item;
+- separate pipelines for native blend modes 0..5;
+- the same MODULATE2X / mode 3/4/5 texture stage as `soft`;
+- type-7 clip and type-12 wipe;
+- inner stencil owners as full-canvas coverage textures rendered with MAX
+  blending, multiplied in the color fragment shader. Multi-mask items use the
+  first owner and are counted in `GpuStats`; outer stencil reference counting
+  remains unimplemented in both backends.
+
+Measured GPU submit cost is ~2.4–2.7 ms at 800×600 and 900×1400 (CPU-side
+vertex conversion/upload dominates), versus 2.1–2.6 ms CPU raster at 800×600
+and 6.8 ms at 900×1400. `eluna`'s single-threaded tick (~7–8 ms) remains the
+frame ceiling.
+
 ## Stack size
 
 eluna scene evaluation is recursive (nested motions, mesh chains). Debug builds

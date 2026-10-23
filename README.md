@@ -26,7 +26,8 @@ src/bin/*            psb-info, psb-dump, psb-key-search, psb-render, psb-anim
 There is no second, project-local animation implementation. Scene evaluation,
 timeline command streams, transitions, loops, physics and masks all come from
 `eluna::EmoteRuntime`. See `vendor/eluna/PROVENANCE.md` for the upstream commit
-and the single local PSB v4 parsing fix.
+and the single local PSB v4 parsing fix. The kernel handoff contract is in
+[`docs/yuris-host.md`](docs/yuris-host.md).
 
 ## Status
 
@@ -39,11 +40,11 @@ and the single local PSB v4 parsing fix.
 | YU-RIS adapter: `EMOTE` params, `EMOTEINFO`, capability, suspend/dirty | ✅ |
 | Texture decode: `RGBA4444`, 32-bpp spec order, RL, PNG fallback | ✅ |
 | Draw plan + CPU rasterizer: native blends 0..5, MODULATE2X, clip, wipe, inner masks | ✅ |
-| Parallel CPU rasterizer (16 bands, incremental edges, deterministic across thread counts) | ✅ |
-| CLI: info/dump/key search/render/timeline PNG sequence/benchmark | ✅ |
+| Parallel CPU rasterizer (16 bands, incremental edges, deterministic across thread counts) | ✅ validation/reference |
+| wgpu backend (`Rgba8Unorm`, shared device, native blends, masks, clip/wipe) | ✅ |
+| CLI: info/dump/key search/render/timeline PNG sequence/benchmark/GPU | ✅ |
 | Demo: 4 real models, expressions, 30 fps alpha-WebM idle loop + one-shot gesture | ✅ |
-| wgpu delivery pipeline | ⏳ |
-| Outer-stencil reference counting, type-4 particles, type-10 feedback, stereovision in the CPU renderer | ⏳ |
+| Outer-stencil reference counting, type-4 particles, type-10 feedback, stereovision in the CPU/GPU renderers | ⏳ |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
 Static-frame renderer parity was checked against the reference `eluna_player`
@@ -131,9 +132,25 @@ What changed:
   reads instead of per-pixel bounds-checked accessors;
 - parallel draw-item vertex generation and cached model-space item bounds.
 
+The wgpu path uses the same `CompositorFrame`-style plan and the kernel's
+target format (`Rgba8Unorm`, no sRGB conversion). Measured on an RTX 5070:
+
+| Canvas | GPU submit (CPU-side encode + upload) | + readback | CPU raster |
+|---|---:|---:|---:|
+| 800×600 | 2.43–2.66 ms | 2.87–3.21 ms | 2.1–2.6 ms |
+| 900×1400 | 2.67 ms | 3.62 ms | 6.83 ms |
+
+The GPU cost is nearly resolution-independent at these sizes because vertex
+conversion/upload dominates; the CPU rasterizer scales with pixels. In the
+kernel the frame is `tick (7–9 ms) + plan (0.9 ms) + GPU submit (~2.5 ms)`,
+about 10.4–12.4 ms (~80–96 fps) at 800×600, with GPU execution overlapped by
+the compositor.
+
 Remaining ceiling: `eluna`'s scene rebuild/physics runs on one thread and costs
-~7–8 ms per 60 Hz tick; rasterization is now a minority of the frame. Further
-gains need runtime-side caching or a GPU offscreen pass.
+~7–8 ms per 60 Hz tick. Further gains need runtime-side caching or a pipeline
+that overlaps tick with rendering. The GPU backend's inner masks are coverage
+textures (not stencil reference counting), matching the CPU path; multi-mask
+items use the first owner and are counted in stats.
 
 ## Verified data
 
