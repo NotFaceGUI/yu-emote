@@ -21,13 +21,20 @@ Reference-only facts (no code copied):
     documented by FreeMote (CC BY-NC-SA 4.0) and eluna (MPL-2.0 crate
     metadata). The implementation in src/psb.rs is independent.
 
-Reference-only projects (no code copied):
-
-3. eluna (https://github.com/xmoezzz/eluna) — the `eluna_rs` crate declares
-   MPL-2.0; the preview player declares MIT OR Apache-2.0. It is used only as
-   a behavioral reference for schema/runtime extraction (native function
-   semantics for inheritance, mesh chains, masks and blend modes). No source
-   code is copied; the Rust implementation here is independent.
+3. eluna (https://github.com/xmoezzz/eluna), commit
+   9a000293968392daa34c83f82b991f7ba25ccc29
+   The `eluna_rs` crate declares MPL-2.0; the preview player declares
+   MIT OR Apache-2.0. This project uses eluna as its primary behavioral
+   reference for timeline command streams, frame interpolation/easing,
+   inheritance and mesh chains, composite stencils, clamp/eye/mouth
+   controllers, physics and the type-7/anchor passes. The Rust modules
+   `src/anim.rs`, `src/pose.rs`, `src/physics.rs`, `src/control.rs`,
+   `src/player.rs`, `src/schema.rs`, `src/plan.rs` and `src/soft.rs`
+   contain algorithms adapted from eluna's recovered-native descriptions
+   and are therefore made available under MPL-2.0 as well. Their source is
+   this repository; the surrounding project remains MIT OR Apache-2.0.
+   The MPL-2.0 text is available at
+   https://www.mozilla.org/en-US/MPL/2.0/.
 
 4. FreeMote and the FreeMote WebGL runtime
    (https://github.com/UlyssesWu/FreeMote) — CC BY-NC-SA 4.0; used only as an

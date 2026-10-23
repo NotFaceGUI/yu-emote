@@ -1,4 +1,6 @@
 //! Typed E-mote model schema.
+//! Algorithms and native semantics adapted from eluna (MPL-2.0,
+//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
 //!
 //! The PSB tree is a generic value container. This module assigns names and
 //! types to the parts of the tree that are **observed in official data** and
@@ -332,6 +334,8 @@ pub struct Controllers {
     pub transition: Vec<Controller>,
     /// Clamp controllers.
     pub clamp: Vec<Controller>,
+    /// Selector controllers (arm/expression variants).
+    pub selector: Vec<Controller>,
     /// Loop controllers.
     pub loop_control: Vec<Controller>,
 }
@@ -498,6 +502,37 @@ pub struct Bounds {
     pub bottom: f64,
 }
 
+/// One cubic-spline piece of a PSB easing curve.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EasingPiece {
+    /// Authored x positions.
+    pub x: Vec<f64>,
+    /// Authored y positions.
+    pub y: Vec<f64>,
+    /// Second-derivative spline coefficients.
+    pub p: Vec<f64>,
+}
+
+/// One top-level easing entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct EasingCurve {
+    /// Pieces covering the input domain.
+    pub pieces: Vec<EasingPiece>,
+}
+
+/// Authored Bezier motion path (`content.cp`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct MotionPath {
+    /// Cubic Bezier control x values (`3 * segments + 1`).
+    pub x: Vec<f64>,
+    /// Cubic Bezier control y values.
+    pub y: Vec<f64>,
+    /// Segment boundary times.
+    pub t: Vec<f64>,
+    /// Per-segment easing curves.
+    pub s: Vec<EasingCurve>,
+}
+
 /// One layer node.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Layer {
@@ -515,6 +550,8 @@ pub struct Layer {
     pub inherit_mask: Option<i64>,
     /// `joinTarget`.
     pub join_target: Option<i64>,
+    /// Type-9 anchor mode (`anchor`).
+    pub anchor: Option<i64>,
     /// `meshCombine`.
     pub mesh_combine: Option<i64>,
     /// `meshTransform`.
@@ -607,6 +644,22 @@ pub struct Content {
     pub motion_flags: Option<u32>,
     /// Sub-motion mask (`motion/mask`).
     pub motion_mask: Option<i64>,
+    /// Coordinate easing reference (`ccc`): index into the model easing table.
+    pub coord_easing: Option<i64>,
+    /// Angle easing reference (`acc`).
+    pub angle_easing: Option<i64>,
+    /// Zoom/scale easing reference (`zcc`).
+    pub zoom_easing: Option<i64>,
+    /// Shear easing reference (`scc`).
+    pub shear_easing: Option<i64>,
+    /// Color easing reference (`occ`).
+    pub color_easing: Option<i64>,
+    /// Stencil-wipe easing reference (`wcc`).
+    pub wipe_easing: Option<i64>,
+    /// Type-9 anchor target label (`anchor.target`).
+    pub anchor_target: Option<String>,
+    /// Authored Bezier motion path (`cp`).
+    pub path: Option<MotionPath>,
     /// Stencil wipe enabled (`stc`).
     pub stencil_wipe_enabled: Option<bool>,
     /// Stencil wipe reverse (`wrv`).
@@ -740,6 +793,8 @@ pub struct Model {
     pub timelines: Vec<Timeline>,
     /// Controllers.
     pub controllers: Controllers,
+    /// Top-level motion easing table.
+    pub easing: Vec<EasingCurve>,
     /// Complete model tree, sorted. Use this for fields without typed access.
     pub raw: JsonValue,
     /// Structural counts.
@@ -763,6 +818,7 @@ impl Model {
             variables: Vec::new(),
             timelines: Vec::new(),
             controllers: Controllers::default(),
+            easing: Vec::new(),
             raw: JsonValue::Null,
             stats: ModelStats {
                 resources: document.resource_data.len(),
@@ -786,6 +842,7 @@ impl Model {
             model.timelines = timelines(map);
             model.controllers = controllers(map);
         }
+        model.easing = easing_table(field(root, "easing"));
         model.parameters = list_or_empty(field(root, "parameter"))
             .iter()
             .map(parameter_def)
@@ -979,6 +1036,7 @@ fn controllers(metadata: &PsbMap) -> Controllers {
         timeline: controller_list(metadata, "timelineControl"),
         transition: controller_list(metadata, "transitionControl"),
         clamp: controller_list(metadata, "clampControl"),
+        selector: controller_list(metadata, "selectorControl"),
         loop_control: controller_list(metadata, "loopControl"),
     }
 }
@@ -1073,6 +1131,7 @@ fn layer(value: &PsbValue, resources: &[Vec<u8>]) -> Layer {
         ground_correction: get_i64(map, "groundCorrection"),
         inherit_mask: get_i64(map, "inheritMask"),
         join_target: get_i64(map, "joinTarget"),
+        anchor: get_i64(map, "anchor"),
         mesh_combine: get_i64(map, "meshCombine"),
         mesh_transform: get_i64(map, "meshTransform"),
         mesh_sync_child_mask: get_i64(map, "meshSyncChildMask"),
@@ -1190,6 +1249,16 @@ fn content(value: &PsbValue) -> Content {
             .and_then(as_i64)
             .map(|value| value as u32),
         motion_mask: motion_obj.and_then(|motion| get_i64(motion, "mask")),
+        coord_easing: get_i64(map, "ccc"),
+        angle_easing: get_i64(map, "acc"),
+        zoom_easing: get_i64(map, "zcc"),
+        shear_easing: get_i64(map, "scc"),
+        color_easing: get_i64(map, "occ"),
+        wipe_easing: get_i64(map, "wcc"),
+        anchor_target: get(map, "anchor")
+            .and_then(as_object)
+            .and_then(|anchor| get_str(anchor, "target")),
+        path: get(map, "cp").and_then(motion_path),
         stencil_wipe_enabled: get(map, "stc").and_then(bool_like),
         stencil_wipe_reverse: get(map, "wrv").and_then(bool_like),
         stencil_wipe_threshold: get_f64(map, "wrt"),
@@ -1228,6 +1297,65 @@ fn color_of(map: &PsbMap) -> (Option<[u32; 4]>, bool) {
     as_i64(value)
         .map(|value| (Some([value as u32; 4]), true))
         .unwrap_or((None, false))
+}
+
+fn easing_table(value: Option<&PsbValue>) -> Vec<EasingCurve> {
+    list_or_empty(value).iter().map(easing_curve).collect()
+}
+
+fn easing_curve(value: &PsbValue) -> EasingCurve {
+    if let Some(map) = as_object(value) {
+        if get(map, "x").is_some() {
+            return EasingCurve {
+                pieces: vec![easing_piece(map)],
+            };
+        }
+        return EasingCurve::default();
+    }
+    let pieces = as_list(value)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(as_object)
+        .map(easing_piece)
+        .collect();
+    EasingCurve { pieces }
+}
+
+fn easing_piece(map: &PsbMap) -> EasingPiece {
+    EasingPiece {
+        x: get(map, "x")
+            .and_then(as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(as_f64)
+            .collect(),
+        y: get(map, "y")
+            .and_then(as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(as_f64)
+            .collect(),
+        p: get(map, "p")
+            .and_then(as_list)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(as_f64)
+            .collect(),
+    }
+}
+
+fn motion_path(value: &PsbValue) -> Option<MotionPath> {
+    let map = as_object(value)?;
+    let x = as_list(get(map, "x")?)?.iter().filter_map(as_f64).collect();
+    let y = as_list(get(map, "y")?)?.iter().filter_map(as_f64).collect();
+    let t = as_list(get(map, "t")?)?.iter().filter_map(as_f64).collect();
+    let s = get(map, "s")
+        .and_then(as_list)
+        .unwrap_or(&[])
+        .iter()
+        .map(easing_curve)
+        .collect();
+    Some(MotionPath { x, y, t, s })
 }
 
 fn parameter_ref(value: &PsbValue) -> Option<ParameterRef> {

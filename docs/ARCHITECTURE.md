@@ -82,7 +82,8 @@ library; tests read it from `YURIS_EMOTE_KEY`.
 1. Official engine behavior / official DLL output (oracle).
 2. Official data (`emote_test.psb`) and the SDK manual.
 3. Public tooling behavior (`emote-psb`, `amadeus-emote-loader`, FreeMote,
-   `eluna`) as *clues*, not truth.
+   `eluna`) as the primary behavioral reference. eluna is MPL-2.0; see
+   `NOTICE` for the adapted modules.
 4. No evidence → explicit `Unsupported`/`NotReady`, never a guessed value.
 
 ## Milestones
@@ -93,21 +94,27 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   visibility / normalization rules still need evidence. The source layout and
   filter rules from `amadeus-emote-loader` (Apache-2.0) are documented
   behavior references; no code was copied.
-- **M2 (core done)** `Animator` for variables/timelines; `pose` evaluates
-  layer frame lists (type 0 hold from the preceding keyframe, type 3
-  interpolation, `ti` quantization), channel-wise `inheritMask`,
-  `transformOrder`, nested type-3 motions, motion-local `parameter` tables,
-  motion-level `parameterize` (eyes/mouth/brows/tears/cheeks), and the native
-  draw order: emission by `priority`, final sort by resolved Z. `psb-render`
-  can play a timeline by name (`--timeline`, `--seconds`, `--loop`).
-  Sprite meshes (`mesh.bp`) are inherited through shape sync
-  (`meshTransform == 1 && meshSyncChildMask & 8`) and combined by pointwise
-  displacement from identity; the patch is sampled in each sprite's own icon
-  box. `meshSyncChildMask` bits 0x1/0x2/0x4 warp child coordinate/angle/scale,
-  and `meshCombinator.combinatorList` interpolates `rawMeshList` resources by
-  variable. Inheritance follows the native transparent-source (`0x400000`)
-  walk with motion-root compensation. Non-zero easing and the official frame
-  rate still need oracle evidence.
+- **M2 (core done)** `Animator` mirrors the native timeline runtime rather
+  than sampling keyframes as curves: crossing a frame boundary issues a
+  variable command, the next frame supplies the transition duration
+  (`next.time - crossing_time - 1`) and easing exponent, type-0 frames are
+  cursor-only, and authored loops advance to `loopEnd` non-inclusively and
+  seek `loopBegin`. The official tick rate is 60 Hz (`EMOTE_TICKS_PER_SECOND`).
+  `pose` handles type 0/3 frames, `ti`, the top-level easing table and
+  `ccc/acc/zcc/scc/occ/wcc` channel curves, `cp` Bezier motion paths,
+  channel-wise `inheritMask`, `transformOrder`, nested type-3 motions,
+  motion-local `parameter` tables, motion-level `parameterize`, and resolved-Z
+  draw order. An omitted/empty `mesh.bp` decodes to the identity patch (this
+  is required for smooth parameterized hair deformations at authored
+  midpoints). `meshSyncChildMask` 0x1/0x2/0x4, `meshCombinator`, native
+  multi-source inheritance and motion-root compensation are implemented.
+  `physics` runs bust and two-segment hair/parts springs;
+  `control` runs clamp and automatic eye blink; `Player` advances timeline →
+  controllers → pose → physics in the native order with deterministic
+  60 Hz ticks. Type-7 clip rectangles are propagated and applied by the CPU
+  rasterizer. `psb-anim` renders a whole timeline to a PNG sequence for the
+  demo video. Remaining M2 work: type-9 anchors, particle/feedback passes,
+  selector/mouth graph queues, wind, and the exact differential fade curve.
 - **M3 (baseline done)** all 58 official shader variants are committed as WGSL
   files under `shaders/`; `plan` turns a pose into textured mesh draw items and
   `soft` rasterizes it deterministically for validation/PNG output. Composite
@@ -115,12 +122,16 @@ library; tests read it from `YURIS_EMOTE_KEY`.
   per motion scope (type-3 sources expand to their nested player's sprites) and
   rasterized into coverage buffers. The native blend table (`sub_1041A190`,
   modes 0..5) and MODULATE2X are applied per pixel. The wgpu pipeline,
-  pixelate pass and the runtime's shader-variant selection rules remain.
+  type-7 clip rectangles are applied per item, and `psb-anim` feeds the
+  WebM demo clips. The wgpu pipeline, pixelate pass, inner/outer stencil
+  phases, and the runtime's shader-variant selection rules remain.
 - **M4** parity: official DLL screenshots vs. this renderer; per-channel
   thresholds declared before measurement.
 
 ## Licensing
 
-MIT OR Apache-2.0. Third-party attributions are in `NOTICE`. Apache-2.0 code
-adopted from `amadeus-emote-loader` will keep its header. No code from
-`eluna` (no license) or FreeMote (CC BY-NC-SA) is copied.
+MIT OR Apache-2.0 for the project as a whole. Third-party attributions are in
+`NOTICE`. The runtime modules listed there adapt algorithms and native
+constants from `eluna` (MPL-2.0), and remain available under MPL-2.0; the
+canonical MPL text is in `LICENSE-MPL-2.0`. FreeMote (CC BY-NC-SA) is used as
+a visual/format oracle only and is not a dependency.

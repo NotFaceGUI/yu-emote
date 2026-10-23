@@ -1,6 +1,9 @@
 //! # yu-emote
 //!
-//! Clean-room E-mote (EMT/PSB) data layer and YU-RIS adapter.
+//! E-mote (EMT/PSB) data layer and YU-RIS adapter.
+//!
+//! The runtime behavior is referenced from the open-source `eluna` project
+//! (MPL-2.0); see `NOTICE` and `README.md`.
 //!
 //! E-mote is a 2D character-animation middleware by M2 Co., Ltd. YU-RIS games
 //! load E-mote models through an optional plugin (`YSEmote.dll` →
@@ -23,8 +26,9 @@
 //! - [`yuris`]: YU-RIS glue — `EMOTE` parameter recording, `EMOTEINFO`
 //!   queries, capability reporting, suspension and dirty-frame tracking.
 //!
-//! Rendering (wgpu/WebGPU) and timeline evaluation are the next milestones;
-//! they are **not** claimed by this version. See `docs/ARCHITECTURE.md`.
+//! Timeline playback, graph/physics controllers and a deterministic CPU
+//! rasterizer are implemented; the wgpu delivery pipeline is still pending.
+//! See `docs/ARCHITECTURE.md`.
 //!
 //! ## Example
 //!
@@ -47,9 +51,12 @@
 #![warn(missing_docs)]
 
 pub mod anim;
+pub mod control;
 pub mod error;
 pub mod model;
+pub mod physics;
 pub mod plan;
+pub mod player;
 pub mod pose;
 pub mod psb;
 pub mod render;
@@ -62,6 +69,7 @@ pub use anim::Animator;
 pub use error::EmoteError;
 pub use model::{ModelSummary, PsbNodeCounts};
 pub use plan::{DrawItem, RenderPlan};
+pub use player::Player;
 pub use pose::{FrameState, LayerPose, Pose};
 pub use psb::PsbDocument;
 pub use schema::Model;

@@ -1,4 +1,6 @@
 //! Render plan generation (M3 geometry bridge).
+//! Algorithms and native semantics adapted from eluna (MPL-2.0,
+//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
 //!
 //! Converts an evaluated [`Pose`] into textured mesh draw items that can be
 //! uploaded to wgpu (or a software rasterizer) without exposing E-mote mesh
@@ -58,6 +60,8 @@ pub struct DrawItem {
     pub mesh_division: u32,
     /// `stencilType` from the layer.
     pub stencil_type: i64,
+    /// Type-7 clip rectangle in model space (`left, top, right, bottom`).
+    pub clip_rect: Option<[f32; 4]>,
     /// Composite-mask group inherited from a type-12 owner.
     pub mask_group: Option<usize>,
     /// Motion scope used to resolve `stencilCompositeMaskLayerList` labels.
@@ -281,6 +285,14 @@ fn build_item(model: &Model, layer: &LayerPose) -> Result<Option<DrawItem>, &'st
         mesh,
         mesh_division: layer.mesh_division,
         stencil_type: layer.stencil_type,
+        clip_rect: layer.clip_rect.map(|rect| {
+            [
+                rect[0] as f32,
+                rect[1] as f32,
+                rect[2] as f32,
+                rect[3] as f32,
+            ]
+        }),
         mask_group: layer.mask_group,
         scope: layer.scope,
         mask: layer.state.mask,
@@ -366,6 +378,8 @@ mod tests {
             mesh_transform: 0,
             mesh_combine: false,
             stencil_type: 0,
+            clip_rect: None,
+            anchor_mode: 0,
             mask_group: None,
             scope: 0,
             mesh: None,

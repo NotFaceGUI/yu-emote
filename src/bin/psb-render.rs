@@ -13,7 +13,7 @@ use std::fs::File;
 use std::process::ExitCode;
 
 use serde_json::json;
-use yu_emote::anim::Animator;
+use yu_emote::player::Player;
 use yu_emote::pose::Pose;
 use yu_emote::psb;
 use yu_emote::schema::Model;
@@ -45,6 +45,9 @@ fn main() -> ExitCode {
     let mut seconds = 0.0f64;
     let mut fps = 60.0f64;
     let mut loop_timeline = false;
+    let mut settle_ticks = 0usize;
+    let mut controls_enabled = true;
+    let mut physics_enabled = true;
     let mut fixed_view: Option<(f32, f32, f32)> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -136,6 +139,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--no-controls" => controls_enabled = false,
+            "--no-physics" => physics_enabled = false,
+            "--settle" => match args.next().map(|value| value.parse::<usize>()) {
+                Some(Ok(value)) => settle_ticks = value,
+                _ => {
+                    eprintln!("--settle needs a non-negative integer");
+                    return ExitCode::FAILURE;
+                }
+            },
             "--view" => {
                 let Some(value) = args.next() else {
                     eprintln!("--view needs SCALE,X,Y");
@@ -173,32 +185,6 @@ fn main() -> ExitCode {
         }
     };
     let model = Model::from_document(&document);
-    let mut timeline_info = None;
-    if let Some(name) = &timeline {
-        let mut animator = Animator::new(&model, fps);
-        if let Err(error) = animator.play_with(name, 1.0, loop_timeline) {
-            eprintln!("timeline `{name}`: {error}");
-            return ExitCode::FAILURE;
-        }
-        let mut ticks = 0usize;
-        let count = (seconds.max(0.0) * fps).round() as usize;
-        for _ in 0..count {
-            animator.tick(1.0 / fps);
-            ticks += 1;
-        }
-        let evaluated = animator.evaluated_variables();
-        // Explicit --var values win over the timeline.
-        for (name, value) in evaluated {
-            variables.entry(name).or_insert(value);
-        }
-        timeline_info = Some(json!({
-            "name": name,
-            "seconds": seconds,
-            "fps": fps,
-            "ticks": ticks,
-            "unsupported_easing": animator.unsupported_easing(),
-        }));
-    }
     let object = object
         .or_else(|| model.metadata.character.clone())
         .or_else(|| model.objects.keys().next().cloned())
@@ -212,7 +198,52 @@ fn main() -> ExitCode {
                 .and_then(|object| object.motions.keys().next().cloned())
         })
         .unwrap_or_default();
-    let Some(pose) = Pose::evaluate(&model, &object, &motion, time, &variables) else {
+    let mut timeline_info = None;
+    let pose = if let Some(name) = &timeline {
+        let mut player = Player::new(&model, &object, &motion, fps);
+        player.controls_enabled = controls_enabled;
+        player.physics_enabled = physics_enabled;
+        for (name, value) in &variables {
+            player.set_variable(name.clone(), *value);
+        }
+        if settle_ticks > 0 {
+            player.settle(&model, settle_ticks);
+        }
+        if let Err(error) = player.play(name, loop_timeline) {
+            eprintln!("timeline `{name}`: {error}");
+            return ExitCode::FAILURE;
+        }
+        let count = (seconds.max(0.0) * fps).round() as usize;
+        for _ in 0..count {
+            player.tick(&model, 1.0 / fps);
+        }
+        // Explicit --var values win over the timeline.
+        player.overlay_variables(&variables);
+        timeline_info = Some(json!({
+            "name": name,
+            "seconds": seconds,
+            "fps": fps,
+            "ticks": count,
+            "physics_controllers": player.physics.bust.len() + player.physics.pend.len(),
+            "unsupported_controls": player.controls.unsupported,
+            "variables": player.variables,
+        }));
+        player.pose(&model)
+    } else if settle_ticks > 0 {
+        let mut player = Player::new(&model, &object, &motion, fps);
+        player.controls_enabled = controls_enabled;
+        player.physics_enabled = physics_enabled;
+        for (name, value) in &variables {
+            player.set_variable(name.clone(), *value);
+        }
+        player.time_ticks = time;
+        player.settle(&model, settle_ticks);
+        player.overlay_variables(&variables);
+        player.pose(&model)
+    } else {
+        Pose::evaluate(&model, &object, &motion, time, &variables)
+    };
+    let Some(pose) = pose else {
         eprintln!("no motion `{object}/{motion}`");
         return ExitCode::FAILURE;
     };

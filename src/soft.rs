@@ -1,4 +1,6 @@
 //! Deterministic software rasterizer for the M3 draw plan.
+//! Algorithms and native semantics adapted from eluna (MPL-2.0,
+//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
 //!
 //! This is a reference path used to validate data/pose/plan without a GPU and
 //! to produce deterministic screenshots for comparison. It is **not** the
@@ -159,6 +161,18 @@ impl ViewTransform {
     }
 }
 
+fn screen_clip(rect: Option<[f32; 4]>, view: ViewTransform) -> Option<[f32; 4]> {
+    let rect = rect?;
+    let a = view.apply([rect[0], rect[1]]);
+    let b = view.apply([rect[2], rect[3]]);
+    Some([
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+    ])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rasterize_triangle(
     target: &mut [u8],
@@ -170,15 +184,22 @@ fn rasterize_triangle(
     v2: &PlanVertex,
     view: ViewTransform,
     mask: Option<&[f32]>,
+    clip: Option<[f32; 4]>,
     blend_mode: u32,
 ) -> usize {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
     let p2 = view.apply(v2.position);
-    let min_x = p0[0].min(p1[0]).min(p2[0]).floor();
-    let max_x = p0[0].max(p1[0]).max(p2[0]).ceil();
-    let min_y = p0[1].min(p1[1]).min(p2[1]).floor();
-    let max_y = p0[1].max(p1[1]).max(p2[1]).ceil();
+    let mut min_x = p0[0].min(p1[0]).min(p2[0]).floor();
+    let mut max_x = p0[0].max(p1[0]).max(p2[0]).ceil();
+    let mut min_y = p0[1].min(p1[1]).min(p2[1]).floor();
+    let mut max_y = p0[1].max(p1[1]).max(p2[1]).ceil();
+    if let Some(clip) = clip {
+        min_x = min_x.max(clip[0]);
+        max_x = max_x.min(clip[2]);
+        min_y = min_y.max(clip[1]);
+        max_y = max_y.min(clip[3]);
+    }
     let min_x = min_x.max(0.0) as i64;
     let max_x = max_x.min(width as f32 - 1.0) as i64;
     let min_y = min_y.max(0.0) as i64;
@@ -383,6 +404,19 @@ pub fn render_plan_with_document(
     plan: &RenderPlan,
     view: ViewTransform,
 ) -> Result<(RenderImage, SoftStats), EmoteError> {
+    let textures = decode_textures(document, model, plan)?;
+    render_with_textures(plan, &textures, view)
+}
+
+/// Decode every texture page referenced by `plan` once.
+///
+/// Animation tooling can reuse the returned map across frames instead of
+/// decoding the same atlas pages for every rendered image.
+pub fn decode_textures(
+    document: &crate::psb::PsbDocument,
+    model: &Model,
+    plan: &RenderPlan,
+) -> Result<BTreeMap<String, DecodedTexture>, EmoteError> {
     let mut textures: BTreeMap<String, DecodedTexture> = BTreeMap::new();
     for item in &plan.items {
         if textures.contains_key(&item.page) {
@@ -404,10 +438,11 @@ pub fn render_plan_with_document(
         };
         textures.insert(item.page.clone(), texture::decode_page(document, page)?);
     }
-    render_with_textures(plan, &textures, view)
+    Ok(textures)
 }
 
-fn render_with_textures(
+/// Render a plan with an already decoded texture set.
+pub fn render_with_textures(
     plan: &RenderPlan,
     textures: &BTreeMap<String, DecodedTexture>,
     view: ViewTransform,
@@ -451,7 +486,17 @@ fn render_with_textures(
                 ) else {
                     continue;
                 };
-                rasterize_triangle_coverage(&mut buffer, width, height, texture, v0, v1, v2, view);
+                rasterize_triangle_coverage(
+                    &mut buffer,
+                    width,
+                    height,
+                    texture,
+                    v0,
+                    v1,
+                    v2,
+                    view,
+                    screen_clip(item.clip_rect, view),
+                );
             }
         }
         stats.mask_sources += source_count;
@@ -491,6 +536,7 @@ fn render_with_textures(
             .mask_group
             .and_then(|group| masks.get(group))
             .and_then(|mask| mask.as_deref());
+        let clip = screen_clip(item.clip_rect, view);
         for triangle in item.indices.chunks_exact(3) {
             let (Some(v0), Some(v1), Some(v2)) = (
                 item.vertices.get(triangle[0] as usize),
@@ -510,6 +556,7 @@ fn render_with_textures(
                 v2,
                 view,
                 mask,
+                clip,
                 item.blend_mode,
             );
         }
@@ -539,14 +586,25 @@ fn rasterize_triangle_coverage(
     v1: &PlanVertex,
     v2: &PlanVertex,
     view: ViewTransform,
+    clip: Option<[f32; 4]>,
 ) -> usize {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
     let p2 = view.apply(v2.position);
-    let min_x = p0[0].min(p1[0]).min(p2[0]).floor().max(0.0) as i64;
-    let max_x = p0[0].max(p1[0]).max(p2[0]).ceil().min(width as f32 - 1.0) as i64;
-    let min_y = p0[1].min(p1[1]).min(p2[1]).floor().max(0.0) as i64;
-    let max_y = p0[1].max(p1[1]).max(p2[1]).ceil().min(height as f32 - 1.0) as i64;
+    let mut min_x = p0[0].min(p1[0]).min(p2[0]).floor();
+    let mut max_x = p0[0].max(p1[0]).max(p2[0]).ceil();
+    let mut min_y = p0[1].min(p1[1]).min(p2[1]).floor();
+    let mut max_y = p0[1].max(p1[1]).max(p2[1]).ceil();
+    if let Some(clip) = clip {
+        min_x = min_x.max(clip[0]);
+        max_x = max_x.min(clip[2]);
+        min_y = min_y.max(clip[1]);
+        max_y = max_y.min(clip[3]);
+    }
+    let min_x = min_x.max(0.0) as i64;
+    let max_x = max_x.min(width as f32 - 1.0) as i64;
+    let min_y = min_y.max(0.0) as i64;
+    let max_y = max_y.min(height as f32 - 1.0) as i64;
     if max_x < min_x || max_y < min_y {
         return 0;
     }

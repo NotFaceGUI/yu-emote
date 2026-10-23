@@ -1,4 +1,6 @@
 //! Layer/frame pose evaluation (M2).
+//! Algorithms and native semantics adapted from eluna (MPL-2.0,
+//! https://github.com/xmoezzz/eluna). See NOTICE and LICENSE-MPL-2.0.
 //!
 //! ## Evidence
 //!
@@ -31,7 +33,10 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::render::MeshPatch;
-use crate::schema::{Content, Frame, IconRef, Layer, Model, Motion, ParameterRef};
+use crate::schema::{
+    Content, EasingCurve, EasingPiece, Frame, IconRef, Layer, Model, Motion, MotionPath,
+    ParameterRef,
+};
 
 /// Full transform-order mask (all linear channels inherited).
 const INHERIT_LINEAR_ALL: i64 = 0x1FC;
@@ -85,6 +90,8 @@ pub struct FrameState {
     pub blend_parameter: f64,
     /// Sub-motion time offset.
     pub motion_time_offset: f64,
+    /// Type-9 anchor target label.
+    pub anchor_target: Option<String>,
 }
 
 impl Default for FrameState {
@@ -111,6 +118,7 @@ impl Default for FrameState {
             blend_mode: 0x10,
             blend_parameter: 0.0,
             motion_time_offset: 0.0,
+            anchor_target: None,
         }
     }
 }
@@ -187,13 +195,26 @@ impl FrameState {
         if let Some(time_offset) = content.motion_time_offset {
             self.motion_time_offset = time_offset;
         }
+        if let Some(target) = &content.anchor_target {
+            self.anchor_target = Some(target.clone());
+        }
     }
 }
 
-/// Evaluate one layer's frame list at `time`.
-///
-/// `previous` is the state before this evaluation (used by `type == 0`).
+/// Evaluate one layer's frame list at `time` without a model easing table.
 pub fn evaluate_frames(frames: &[Frame], time: f64, previous: Option<&FrameState>) -> FrameState {
+    evaluate_frames_with_easing(frames, time, previous, &[], 0)
+}
+
+/// Evaluate one layer's frame list with the model easing table and coordinate
+/// plane. `coordinate_plane == 0` maps XY; any other value maps XZ.
+pub fn evaluate_frames_with_easing(
+    frames: &[Frame],
+    time: f64,
+    previous: Option<&FrameState>,
+    easing_table: &[EasingCurve],
+    coordinate_plane: i64,
+) -> FrameState {
     let Some(current_index) = frames
         .iter()
         .enumerate()
@@ -273,42 +294,195 @@ pub fn evaluate_frames(frames: &[Frame], time: f64, previous: Option<&FrameState
 
     let mut next_state = FrameState::default();
     next_state.apply_content(next_content);
-    interpolate_state(&mut state, &next_state, t);
+    interpolate_state(
+        &mut state,
+        &next_state,
+        content,
+        t,
+        easing_table,
+        coordinate_plane,
+    );
     state
 }
 
-fn interpolate_state(state: &mut FrameState, next: &FrameState, t: f64) {
-    for axis in 0..3 {
-        state.coord[axis] = lerp(state.coord[axis], next.coord[axis], t);
-    }
-    for axis in 0..2 {
-        state.origin[axis] = lerp(state.origin[axis], next.origin[axis], t);
-        state.scale[axis] = lerp(state.scale[axis], next.scale[axis], t);
-        state.shear[axis] = lerp(state.shear[axis], next.shear[axis], t);
-    }
-    state.rotation_deg = lerp_angle(state.rotation_deg, next.rotation_deg, t);
+fn interpolate_state(
+    state: &mut FrameState,
+    next: &FrameState,
+    current_content: &Content,
+    t: f64,
+    easing_table: &[EasingCurve],
+    coordinate_plane: i64,
+) {
+    // Native per-property curves live on the CURRENT type-3 frame:
+    // ccc = coordinate, acc = angle, zcc = zoom, scc = shear, occ = color.
+    // Opacity uses the raw interpolation factor.
+    let coord_t = frame_easing(t, current_content.coord_easing, easing_table);
+    let angle_t = frame_easing(t, current_content.angle_easing, easing_table);
+    let zoom_t = frame_easing(t, current_content.zoom_easing, easing_table);
+    let shear_t = frame_easing(t, current_content.shear_easing, easing_table);
+
+    let start = state.coord;
+    let end = next.coord;
+    state.coord = if start == end {
+        start
+    } else if let Some(path) = &current_content.path {
+        evaluate_motion_path(path, coord_t).map_or_else(
+            || {
+                [
+                    lerp(start[0], end[0], coord_t),
+                    lerp(start[1], end[1], coord_t),
+                    lerp(start[2], end[2], coord_t),
+                ]
+            },
+            |[u, v]| {
+                if coordinate_plane == 0 {
+                    let dx = end[0] - start[0];
+                    let dy = end[1] - start[1];
+                    [
+                        start[0] + dx * u - dy * v,
+                        start[1] + dy * u + dx * v,
+                        lerp(start[2], end[2], coord_t),
+                    ]
+                } else {
+                    let dx = end[0] - start[0];
+                    let dz = end[2] - start[2];
+                    [
+                        start[0] + dx * u - dz * v,
+                        lerp(start[1], end[1], coord_t),
+                        start[2] + dz * u + dx * v,
+                    ]
+                }
+            },
+        )
+    } else {
+        [
+            lerp(start[0], end[0], coord_t),
+            lerp(start[1], end[1], coord_t),
+            lerp(start[2], end[2], coord_t),
+        ]
+    };
+
+    // ox/oy are not part of the recovered StepFrame interpolation block.
+    state.scale[0] = lerp(state.scale[0], next.scale[0], zoom_t);
+    state.scale[1] = lerp(state.scale[1], next.scale[1], zoom_t);
+    state.rotation_deg = lerp_angle(state.rotation_deg, next.rotation_deg, angle_t);
+    state.shear[0] = lerp(state.shear[0], next.shear[0], shear_t);
+    state.shear[1] = lerp(state.shear[1], next.shear[1], shear_t);
     state.opacity = (lerp(state.opacity, next.opacity, t) + 0.5).floor();
+    let color_t = frame_easing(t, current_content.color_easing, easing_table);
     for channel in 0..4 {
-        state.color[channel] = lerp_color(state.color[channel], next.color[channel], t);
+        state.color[channel] = lerp_color(state.color[channel], next.color[channel], color_t);
     }
-    if let (Some(current), Some(next)) = (&state.mesh_bp, &next.mesh_bp) {
-        if current.len() == next.len() {
-            let mut mesh = current.clone();
-            for (slot, target) in mesh.iter_mut().zip(next.iter()) {
-                *slot = lerp(*slot, *target, t);
-            }
-            state.mesh_bp = Some(mesh);
+    // An omitted or empty `mesh.bp` decodes to the identity patch, not to
+    // "keep the previous mesh". Interpolating frame 0's deformation to the
+    // empty frame at 30 is therefore a smooth return to neutral; treating the
+    // empty frame as absent made the parameter snap at the authored midpoint.
+    if state.mesh_bp.is_some() || next.mesh_bp.is_some() {
+        let current = MeshPatch::from_bp(state.mesh_bp.as_deref());
+        let target = MeshPatch::from_bp(next.mesh_bp.as_deref());
+        let blended = MeshPatch::interpolate(&current, &target, t as f32);
+        let mut flat = Vec::with_capacity(32);
+        for point in &blended.control_points {
+            flat.push(point[0] as f64);
+            flat.push(point[1] as f64);
+        }
+        state.mesh_bp = Some(flat);
+    }
+}
+
+fn frame_easing(t: f64, reference: Option<i64>, easing_table: &[EasingCurve]) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    let Some(index) = reference.filter(|index| *index >= 0) else {
+        return t;
+    };
+    easing_table
+        .get(index as usize)
+        .and_then(|curve| evaluate_easing_curve(curve, t))
+        .unwrap_or(t)
+}
+
+fn evaluate_easing_curve(curve: &EasingCurve, x: f64) -> Option<f64> {
+    if curve.pieces.is_empty() {
+        return None;
+    }
+    for piece in &curve.pieces {
+        if piece.x.len() >= 2 && x >= piece.x[0] && x <= *piece.x.last()? {
+            return evaluate_easing_piece(piece, x);
         }
     }
-    if state.src.is_none() {
-        state.src = next.src.clone();
+    // Malformed/gapped tables use the closest authored endpoint rather than
+    // an invented smoothstep fallback.
+    let piece = curve.pieces.iter().min_by(|a, b| {
+        let da = a.x.first().map_or(f64::INFINITY, |start| (x - start).abs());
+        let db = b.x.first().map_or(f64::INFINITY, |start| (x - start).abs());
+        da.total_cmp(&db)
+    })?;
+    evaluate_easing_piece(piece, x)
+}
+
+fn evaluate_easing_piece(piece: &EasingPiece, x: f64) -> Option<f64> {
+    if piece.x.len() < 2 || piece.x.len() != piece.y.len() || piece.x.len() != piece.p.len() {
+        return None;
     }
-    if state.icon.is_none() {
-        state.icon = next.icon.clone();
+    let mut interval = 0usize;
+    while interval + 1 < piece.x.len() - 1 && x > piece.x[interval + 1] {
+        interval += 1;
     }
-    if state.mesh_bp.is_none() {
-        state.mesh_bp = next.mesh_bp.clone();
+    while interval > 0 && x < piece.x[interval] {
+        interval -= 1;
     }
+    let x0 = piece.x[interval];
+    let x1 = piece.x[interval + 1];
+    let h = x1 - x0;
+    if !h.is_finite() || h.abs() <= f64::EPSILON {
+        return Some(piece.y[interval]);
+    }
+    let u = (x - x0) / h;
+    let v = 1.0 - u;
+    let cubic_u = u * u * u - u;
+    let cubic_v = v * v * v - v;
+    let linear = v * piece.y[interval] + u * piece.y[interval + 1];
+    Some(linear + h * h * (cubic_u * piece.p[interval + 1] + cubic_v * piece.p[interval]) / 6.0)
+}
+
+fn evaluate_motion_path(path: &MotionPath, t: f64) -> Option<[f64; 2]> {
+    if path.t.len() < 2 || path.x.len() < 4 || path.y.len() < 4 {
+        return None;
+    }
+    let segments = path.t.len() - 1;
+    let mut segment = 0usize;
+    while segment + 1 < segments && t > path.t[segment + 1] {
+        segment += 1;
+    }
+    while segment > 0 && path.t[segment] > t {
+        segment -= 1;
+    }
+    let t0 = path.t[segment];
+    let t1 = path.t[segment + 1];
+    let span = t1 - t0;
+    let local = if span.is_finite() && span.abs() > f64::EPSILON {
+        (t - t0) / span
+    } else {
+        0.0
+    };
+    let u = path
+        .s
+        .get(segment)
+        .and_then(|curve| evaluate_easing_curve(curve, local))
+        .unwrap_or(local);
+    let v = 1.0 - u;
+    let b0 = v * v * v;
+    let b1 = 3.0 * v * v * u;
+    let b2 = 3.0 * v * u * u;
+    let b3 = u * u * u;
+    let base = segment * 3;
+    if base + 3 >= path.x.len() || base + 3 >= path.y.len() {
+        return None;
+    }
+    Some([
+        b0 * path.x[base] + b1 * path.x[base + 1] + b2 * path.x[base + 2] + b3 * path.x[base + 3],
+        b0 * path.y[base] + b1 * path.y[base + 1] + b2 * path.y[base + 2] + b3 * path.y[base + 3],
+    ])
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
@@ -316,9 +490,20 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 }
 
 fn lerp_color(a: u32, b: u32, t: f64) -> u32 {
-    // Native interpolation uses an 8-bit weighted average; round to nearest.
-    let value = (a as f64) + ((b as f64) - (a as f64)) * t;
-    value.round().clamp(0.0, 255.0) as u32
+    // Native `sub_103A4E90`: colors are 0xRRGGBBAA and interpolation happens
+    // per byte lane with weight = floor(t * 256), not per 32-bit scalar.
+    if a == b {
+        return a;
+    }
+    let weight = (t.clamp(0.0, 1.0) * 256.0) as u32;
+    let inverse = 256u32.saturating_sub(weight);
+    let rb_a = a & 0x00FF_00FF;
+    let rb_b = b & 0x00FF_00FF;
+    let ga_a = (a >> 8) & 0x00FF_00FF;
+    let ga_b = (b >> 8) & 0x00FF_00FF;
+    let rb = ((weight * rb_b + inverse * rb_a) >> 8) & 0x00FF_00FF;
+    let ga = (((weight * ga_b + inverse * ga_a) >> 8) & 0x00FF_00FF) << 8;
+    rb | ga
 }
 
 fn lerp_angle(a: f64, b: f64, t: f64) -> f64 {
@@ -847,6 +1032,10 @@ pub struct LayerPose {
     pub mesh_transform: i64,
     /// `meshCombine` flag.
     pub mesh_combine: bool,
+    /// Type-7 clip rectangle in world space (`left, top, right, bottom`).
+    pub clip_rect: Option<[f64; 4]>,
+    /// Type-9 anchor mode (`anchor`).
+    pub anchor_mode: i64,
     /// `stencilType`.
     pub stencil_type: i64,
     /// Composite-mask group inherited from the nearest type-12 owner with
@@ -940,6 +1129,7 @@ impl Pose {
             source: InheritSource::root(),
             motion_root: InheritSource::root(),
             motion_independent: false,
+            clip: None,
         };
         let ranks = motion.priority_ranks(time);
         let mut counter = 0i64;
@@ -965,6 +1155,7 @@ impl Pose {
                 &mut counter,
             ));
         }
+        apply_anchor_pass(&mut layers);
         let mut pose = Self {
             object: object.to_string(),
             motion: motion_name.to_string(),
@@ -975,6 +1166,27 @@ impl Pose {
         };
         resolve_mask_sources(&pose.layers, &mut pose.mask_groups);
         pose
+    }
+
+    /// World position of the first layer with `label`.
+    ///
+    /// Physics controllers anchor to the finalized StepFrame XYZ of their
+    /// `baseLayer` (`center_bust`, `center_fronthair`, ...). The label is
+    /// resolved over the whole evaluated tree, including nested motions.
+    pub fn layer_position(&self, label: Option<&str>) -> Option<[f64; 3]> {
+        let label = label.filter(|label| !label.is_empty())?;
+        fn find(layers: &[LayerPose], label: &str) -> Option<[f64; 3]> {
+            for layer in layers {
+                if layer.label == label {
+                    return Some(layer.world_origin);
+                }
+                if let Some(position) = find(&layer.children, label) {
+                    return Some(position);
+                }
+            }
+            None
+        }
+        find(&self.layers, label)
     }
 
     /// Flatten all visible drawable layers.
@@ -1055,6 +1267,8 @@ struct Context {
     /// `motionIndependentLayerInherit` of the nested player that owns this
     /// context.
     motion_independent: bool,
+    /// Type-7 clip rectangle inherited from ancestors.
+    clip: Option<[f64; 4]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1088,7 +1302,13 @@ fn evaluate_layer(
     )
     .unwrap_or(fallback_time);
     let inherit_mask = layer.inherit_mask.unwrap_or(0);
-    let mut state = evaluate_frames(&layer.frames, sample_time, None);
+    let mut state = evaluate_frames_with_easing(
+        &layer.frames,
+        sample_time,
+        None,
+        &model.easing,
+        layer.coordinate.unwrap_or(0),
+    );
     if let Some(sync) = parent.source.mesh_sync {
         apply_mesh_sync_child_state(&mut state, sync, inherit_mask);
     }
@@ -1147,6 +1367,16 @@ fn evaluate_layer(
     let visible_chain = parent.visible && opacity > 0.0;
     let visible = visible_chain && drawable && has_geometry;
 
+    // Type-7 clip rectangle (`sub_10352360`). An active type-7 layer replaces
+    // the inherited rect with its transformed +/-16 box intersected with the
+    // inherited rectangle; inactive type-7 layers simply inherit.
+    let clip_rect = if layer.kind == 7 && visible_chain {
+        let own = type7_local_bounds(world, world_origin, state.origin);
+        intersect_clip_rect(parent.clip, own)
+    } else {
+        parent.clip
+    };
+
     // `stencilType & 4` marks a composite-mask owner. Its descendants are
     // clipped by the union of the named source layers, resolved in this
     // motion scope (native sub_103390C0 second pass).
@@ -1173,15 +1403,11 @@ fn evaluate_layer(
     // only warp the child's coordinate/angle/scale (`sub_10335500`) and do
     // not propagate the patch. Patches are combined by adding control-point
     // displacement from identity, not by composing the Bezier mappings.
-    let own_mesh = state
-        .mesh_bp
-        .as_deref()
-        .filter(|bp| bp.len() >= 32)
-        .map(|bp| {
-            MeshPatch::from_bp(Some(bp))
-                .with_division(layer.mesh_division.unwrap_or(1) as u32)
-                .with_domain(layer_mesh_domain(layer))
-        });
+    let own_mesh = state.mesh_bp.as_deref().map(|bp| {
+        MeshPatch::from_bp(Some(bp))
+            .with_division(layer.mesh_division.unwrap_or(1) as u32)
+            .with_domain(layer_mesh_domain(layer))
+    });
     let combinator = layer.mesh_combinator.as_ref().and_then(|combinator| {
         evaluate_mesh_combinator(combinator, layer, motion_parameters, variables)
     });
@@ -1243,6 +1469,7 @@ fn evaluate_layer(
         source: child_source,
         motion_root: parent.motion_root,
         motion_independent: parent.motion_independent,
+        clip: clip_rect,
     };
     let mut children: Vec<LayerPose> = layer
         .children
@@ -1362,6 +1589,8 @@ fn evaluate_layer(
         mesh_division: layer.mesh_division.unwrap_or(1).max(1) as u32,
         mesh_transform: layer.mesh_transform.unwrap_or(0),
         mesh_combine: layer.mesh_combine.unwrap_or(0) != 0,
+        clip_rect,
+        anchor_mode: layer.anchor.unwrap_or(0),
         stencil_type: layer.stencil_type.unwrap_or(0),
         mask_group: inherited_mask_group,
         scope,
@@ -1369,6 +1598,186 @@ fn evaluate_layer(
         priority_path,
         children,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnchorRequest {
+    target: [f64; 3],
+    mode: i32,
+    current: [f64; 3],
+    flip_x: bool,
+    flip_y: bool,
+}
+
+/// Native type-9 anchor pass (`sub_10351120`).
+///
+/// All anchors in the motion scope are evaluated first, then every authored
+/// layer is shifted by one aggregate XYZ offset. Exact constraints win over
+/// the positive-side constraint, which wins over the negative-side one.
+fn apply_anchor_pass(layers: &mut [LayerPose]) {
+    let mut requests = Vec::new();
+    let fallback = layers.first().map(|layer| layer.world_origin);
+    let positions = layer_positions(layers);
+    collect_anchor_requests(layers, &positions, fallback, &mut requests);
+    if requests.is_empty() {
+        return;
+    }
+
+    let mut low_active = [false; 3];
+    let mut exact_active = [false; 3];
+    let mut high_active = [false; 3];
+    let mut low_shift = [f64::INFINITY; 3];
+    let mut exact_shift = [0.0; 3];
+    let mut high_shift = [f64::NEG_INFINITY; 3];
+
+    for request in requests {
+        let mode = anchor_mode_after_flip(request.mode, request.flip_x, request.flip_y);
+        if !(0..=8).contains(&mode) {
+            continue;
+        }
+        let axis = (mode / 3) as usize;
+        let kind = mode % 3;
+        let delta = request.target[axis] - request.current[axis];
+        match kind {
+            0 => {
+                if request.current[axis] > request.target[axis] {
+                    low_active[axis] = true;
+                    low_shift[axis] = low_shift[axis].min(delta);
+                }
+            }
+            1 => {
+                exact_active[axis] = true;
+                exact_shift[axis] = delta;
+            }
+            2 => {
+                if request.target[axis] > request.current[axis] {
+                    high_active[axis] = true;
+                    high_shift[axis] = high_shift[axis].max(delta);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    let shift = [0, 1, 2].map(|axis| {
+        if exact_active[axis] {
+            exact_shift[axis]
+        } else if high_active[axis] {
+            high_shift[axis]
+        } else if low_active[axis] {
+            low_shift[axis]
+        } else {
+            0.0
+        }
+    });
+    if shift == [0.0; 3] {
+        return;
+    }
+    fn walk(layers: &mut [LayerPose], shift: [f64; 3]) {
+        for layer in layers {
+            for (axis, value) in shift.iter().enumerate() {
+                layer.world_origin[axis] += value;
+            }
+            layer.world.tx += shift[0];
+            layer.world.ty += shift[1];
+            if let Some(rect) = &mut layer.clip_rect {
+                rect[0] += shift[0];
+                rect[1] += shift[1];
+                rect[2] += shift[0];
+                rect[3] += shift[1];
+            }
+            walk(&mut layer.children, shift);
+        }
+    }
+    walk(layers, shift);
+}
+
+fn collect_anchor_requests(
+    layers: &[LayerPose],
+    positions: &BTreeMap<String, [f64; 3]>,
+    fallback: Option<[f64; 3]>,
+    out: &mut Vec<AnchorRequest>,
+) {
+    for layer in layers {
+        if layer.kind == 9 {
+            if let Some(target) = layer.state.anchor_target.as_deref() {
+                if !target.is_empty() {
+                    if let Some(target_position) = positions.get(target).copied().or(fallback) {
+                        out.push(AnchorRequest {
+                            target: target_position,
+                            mode: layer.anchor_mode as i32,
+                            current: layer.world_origin,
+                            flip_x: layer.state.flip_x,
+                            flip_y: layer.state.flip_y,
+                        });
+                    }
+                }
+            }
+        }
+        collect_anchor_requests(&layer.children, positions, fallback, out);
+    }
+}
+
+fn layer_positions(layers: &[LayerPose]) -> BTreeMap<String, [f64; 3]> {
+    fn walk(layers: &[LayerPose], out: &mut BTreeMap<String, [f64; 3]>) {
+        for layer in layers {
+            out.entry(layer.label.clone()).or_insert(layer.world_origin);
+            walk(&layer.children, out);
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(layers, &mut out);
+    out
+}
+
+fn anchor_mode_after_flip(mut mode: i32, flip_x: bool, flip_y: bool) -> i32 {
+    if flip_x {
+        if mode == 0 {
+            mode = 2;
+        } else if mode == 2 {
+            mode = 3;
+        }
+    }
+    if flip_y {
+        if mode == 3 {
+            mode = 5;
+        } else if mode == 5 {
+            mode = 3;
+        }
+    }
+    mode
+}
+
+fn type7_local_bounds(world: Affine2, origin: [f64; 3], frame_offset: [f64; 2]) -> [f64; 4] {
+    // Native `sub_10352360`:
+    //   offset = M * (ox, oy)
+    //   lo = M * (-16, -16), hi = M * (16, 16)
+    //   p = raw_position + lo/hi - offset
+    let transform = |x: f64, y: f64| world.apply_linear([x, y]);
+    let offset = transform(frame_offset[0], frame_offset[1]);
+    let lo = transform(-16.0, -16.0);
+    let hi = transform(16.0, 16.0);
+    let p0 = [origin[0] + lo[0] - offset[0], origin[1] + lo[1] - offset[1]];
+    let p1 = [origin[0] + hi[0] - offset[0], origin[1] + hi[1] - offset[1]];
+    [
+        p0[0].min(p1[0]),
+        p0[1].min(p1[1]),
+        p0[0].max(p1[0]),
+        p0[1].max(p1[1]),
+    ]
+}
+
+fn intersect_clip_rect(inherited: Option<[f64; 4]>, own: [f64; 4]) -> Option<[f64; 4]> {
+    let Some(parent) = inherited else {
+        return Some(own);
+    };
+    let rect = [
+        parent[0].max(own[0]),
+        parent[1].max(own[1]),
+        parent[2].min(own[2]),
+        parent[3].min(own[3]),
+    ];
+    (rect[0] <= rect[2] && rect[1] <= rect[3]).then_some(rect)
 }
 
 fn map_coordinate(source: InheritSource, coord: [f64; 3]) -> [f64; 3] {
@@ -1552,6 +1961,96 @@ mod tests {
     }
 
     #[test]
+    fn frame_easing_table_reshapes_coordinate_interpolation() {
+        let curve = EasingCurve {
+            pieces: vec![EasingPiece {
+                x: vec![0.0, 1.0],
+                y: vec![0.0, 1.0],
+                p: vec![0.0, 6.0],
+            }],
+        };
+        let frames = vec![
+            Frame {
+                time: 0,
+                kind: 3,
+                time_quantization: None,
+                content: Some(Content {
+                    coord: Some([0.0, 0.0, 0.0]),
+                    coord_easing: Some(0),
+                    ..Content::default()
+                }),
+            },
+            Frame {
+                time: 10,
+                kind: 2,
+                time_quantization: None,
+                content: Some(Content {
+                    coord: Some([10.0, 0.0, 0.0]),
+                    ..Content::default()
+                }),
+            },
+        ];
+        let state = evaluate_frames_with_easing(&frames, 5.0, None, &[curve], 0);
+        // At t=0.5 the native spline returns 0.375.
+        // At t=0.5 the native spline returns 0.125 for p=[0,6].
+        assert!(
+            (state.coord[0] - 1.25).abs() < 1.0e-9,
+            "coord={:?}",
+            state.coord
+        );
+    }
+
+    #[test]
+    fn native_color_lane_interpolation_matches_native() {
+        assert_eq!(lerp_color(0x0000_0000, 0xFFFF_FFFF, 0.0), 0x0000_0000);
+        assert_eq!(lerp_color(0x0000_0000, 0xFFFF_FFFF, 0.5), 0x7F7F_7F7F);
+        assert_eq!(lerp_color(0x0000_0000, 0xFFFF_FFFF, 1.0), 0xFFFF_FFFF);
+        assert_eq!(lerp_color(0x1234_5678, 0x1234_5678, 0.25), 0x1234_5678);
+    }
+
+    #[test]
+    fn type7_local_bounds_uses_world_transform_and_frame_offset() {
+        let world = Affine2 {
+            m11: 2.0,
+            m12: 0.0,
+            m21: 0.0,
+            m22: 2.0,
+            tx: 100.0,
+            ty: 100.0,
+        };
+        let rect = type7_local_bounds(world, [100.0, 100.0, 0.0], [4.0, -4.0]);
+        // offset = (8,-8), lo = (-32,-32), hi = (32,32)
+        assert_eq!(rect, [60.0, 76.0, 124.0, 140.0]);
+        let clipped = intersect_clip_rect(Some([0.0, 0.0, 100.0, 100.0]), rect).unwrap();
+        assert_eq!(clipped, [60.0, 76.0, 100.0, 100.0]);
+        assert!(intersect_clip_rect(Some([0.0, 0.0, 10.0, 10.0]), rect).is_none());
+    }
+
+    #[test]
+    fn anchor_mode_flip_mapping_matches_native() {
+        assert_eq!(anchor_mode_after_flip(0, true, false), 2);
+        assert_eq!(anchor_mode_after_flip(2, true, false), 3);
+        assert_eq!(anchor_mode_after_flip(3, false, true), 5);
+        assert_eq!(anchor_mode_after_flip(5, false, true), 3);
+        assert_eq!(anchor_mode_after_flip(8, true, true), 8);
+    }
+
+    #[test]
+    fn anchor_pass_shifts_every_layer_to_exact_target() {
+        let mut target = drawable_layer("T", 0.0, &[]);
+        target.world_origin = [10.0, 0.0, 0.0];
+        let mut anchor = drawable_layer("A", 0.0, &[]);
+        anchor.kind = 9;
+        anchor.anchor_mode = 1;
+        anchor.state.anchor_target = Some("T".to_string());
+        anchor.world_origin = [50.0, 0.0, 0.0];
+        let mut layers = vec![target, anchor];
+        apply_anchor_pass(&mut layers);
+        assert!((layers[0].world_origin[0] + 30.0).abs() < 1.0e-9);
+        assert!((layers[1].world_origin[0] - 10.0).abs() < 1.0e-9);
+    }
+
+    #[test]
     fn type_zero_frame_holds_preceding_content() {
         let frames = [
             Frame {
@@ -1593,6 +2092,8 @@ mod tests {
             mesh_transform: 0,
             mesh_combine: false,
             stencil_type: 0,
+            clip_rect: None,
+            anchor_mode: 0,
             mask_group: None,
             scope: 0,
             mesh: None,

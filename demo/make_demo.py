@@ -17,6 +17,7 @@ import argparse
 import base64
 import io
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,7 @@ from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 RENDER = ROOT / "target" / "debug" / ("psb-render.exe" if sys.platform == "win32" else "psb-render")
+ANIM = ROOT / "target" / "debug" / ("psb-anim.exe" if sys.platform == "win32" else "psb-anim")
 OUT = ROOT / "target" / "emote-demo"
 
 POSES = [
@@ -47,6 +49,55 @@ def run_render(psb: Path, key: str | None, extra: list[str], out: Path) -> dict:
         return json.loads(proc.stdout)
     except json.JSONDecodeError:
         return {}
+
+
+def run_anim(psb: Path, key: str | None, extra: list[str], out_dir: Path) -> dict | None:
+    cmd = [str(ANIM), str(psb), *extra, "--out-dir", str(out_dir)]
+    if key:
+        cmd += ["--key", key]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def encode_video(
+    frames: list[Path],
+    box: tuple[int, int, int, int],
+    size: tuple[int, int],
+    out: Path,
+    fps: int,
+) -> str | None:
+    if not frames or shutil.which("ffmpeg") is None:
+        return None
+    temp = out.parent / f"{out.stem}-frames"
+    if temp.exists():
+        shutil.rmtree(temp)
+    temp.mkdir(parents=True)
+    for index, frame in enumerate(frames):
+        image = Image.open(frame).convert("RGBA").crop(box).resize(size, Image.LANCZOS)
+        image.save(temp / f"frame-{index:04}.png")
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-framerate", str(fps),
+        "-i", str(temp / "frame-%04d.png"),
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-b:v", "0",
+        "-crf", "34",
+        "-auto-alt-ref", "0",
+        "-an",
+        str(out),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    shutil.rmtree(temp, ignore_errors=True)
+    if proc.returncode != 0:
+        print(proc.stderr, file=sys.stderr)
+        return None
+    return base64.b64encode(out.read_bytes()).decode("ascii")
 
 
 def trim_union(images: list[Image.Image], pad: int = 26) -> tuple[int, int, int, int]:
@@ -85,6 +136,7 @@ def main() -> int:
     parser.add_argument("--model", action="append", required=True, help="LABEL=PATH to a PSB")
     parser.add_argument("--key", default=None, help="per-game PSB key for encrypted models")
     parser.add_argument("--max-height", type=int, default=860)
+    parser.add_argument("--force", action="store_true", help="re-render cached clips")
     args = parser.parse_args()
 
     if not RENDER.exists():
@@ -117,31 +169,58 @@ def main() -> int:
                 (pose_id, pose_label, accent, Image.open(raw_path).convert("RGBA"), stats)
             )
 
-        # Idle timeline frames (Nekopara 待機ループ00; skipped for models that
-        # do not provide it, e.g. the ERIS test model).
-        anim = []
-        try:
-            for index in range(6):
-                raw_path = OUT / "frames" / f"{stem}-idle-{index}.png"
-                extra = [
+        # Full idle loop as a VP9/WebM clip. The native timeline is 421 ticks
+        # at 60 Hz (7.0167 s); 15 fps keeps the preview smooth while the
+        # renderer advances four engine ticks per output frame.
+        anim_dir = OUT / "frames" / f"{stem}-anim"
+        webm_path = OUT / "frames" / f"{stem}-idle.webm"
+        expected_frames = 210
+        anim_frames = sorted(anim_dir.glob("frame-*.png")) if anim_dir.exists() else []
+        if args.force or len(anim_frames) < expected_frames:
+            anim_info = run_anim(
+                path,
+                args.key,
+                [
                     "--timeline",
                     "待機ループ00",
-                    "--loop",
+                    "--fps",
+                    "30",
                     "--seconds",
-                    f"{index * 0.15:.2f}",
+                    "7.0",
                     *fixed,
-                ]
-                run_render(path, args.key, extra, raw_path)
-                anim.append(Image.open(raw_path).convert("RGBA"))
-        except SystemExit:
-            anim = []
+                ],
+                anim_dir,
+            )
+            anim_frames = sorted(anim_dir.glob("frame-*.png")) if anim_info else []
+        else:
+            anim_frames = anim_frames[:expected_frames]
 
-        box = trim_union([frame[3] for frame in rendered] + anim)
+        stills = [frame[3] for frame in rendered]
+        if anim_frames:
+            stills.append(Image.open(anim_frames[0]).convert("RGBA"))
+        box = trim_union(stills)
         height = min(args.max_height, box[3] - box[1])
         width = max(1, round((box[2] - box[0]) * height / (box[3] - box[1])))
 
         def encode(image: Image.Image) -> str:
             return encode_webp(image.crop(box).resize((width, height), Image.LANCZOS))
+
+        video = None
+        if anim_frames and (args.force or not webm_path.exists()):
+            encoded = encode_video(
+                anim_frames,
+                box,
+                (width, height),
+                webm_path,
+                30,
+            )
+            if encoded:
+                video = f"data:video/webm;base64,{encoded}"
+        elif anim_frames and webm_path.exists():
+            video = (
+                "data:video/webm;base64,"
+                + base64.b64encode(webm_path.read_bytes()).decode("ascii")
+            )
 
         models.append(
             {
@@ -151,7 +230,7 @@ def main() -> int:
                     pid: f"data:image/webp;base64,{encode(image)}"
                     for pid, _, _, image, _ in rendered
                 },
-                "anim": [f"data:image/webp;base64,{encode(image)}" for image in anim],
+                "video": video,
                 "poseMeta": [
                     {"id": pid, "label": plabel, "accent": accent}
                     for pid, plabel, accent, _, _ in rendered
@@ -209,12 +288,14 @@ def main() -> int:
     background: radial-gradient(ellipse, #00000088, transparent 70%); filter: blur(7px);
     pointer-events: none;
   }}
-  #view {{
-    position: relative; z-index: 1; max-height: calc(100% - 6px); max-width: 94%; object-fit: contain;
+  #view, #view-next, #anim {{
+    position: absolute; inset: 0; margin: auto; z-index: 1;
+    max-height: calc(100% - 6px); max-width: 94%; object-fit: contain;
     filter: drop-shadow(0 18px 26px #00000066) drop-shadow(0 2px 3px #00000088);
-    transition: opacity .16s ease, transform .2s ease;
+    transition: opacity .26s ease;
   }}
-  #view.swap {{ opacity: .12; transform: translateY(3px) scale(.995); }}
+  #view-next {{ opacity: 0; }}
+  #anim {{ display: none; }}
   .panel {{ border: 1px solid var(--line); border-radius: 16px; background: var(--panel); padding: 16px; }}
   .panel h2 {{ margin: 0 0 9px; font-size: 11.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted); font-weight: 650; }}
   .chips {{ display: flex; flex-wrap: wrap; gap: 7px; }}
@@ -244,7 +325,11 @@ def main() -> int:
   </header>
 
   <div class="layout">
-    <div class="stage"><img id="view" alt="E-mote render"></div>
+    <div class="stage">
+      <img id="view" alt="E-mote render">
+      <img id="view-next" alt="">
+      <video id="anim" muted loop playsinline autoplay preload="auto"></video>
+    </div>
     <aside>
       <div class="panel">
         <h2>Characters</h2>
@@ -262,8 +347,9 @@ def main() -> int:
           <span>canvas</span><b id="st-tex">—</b>
         </div>
         <div class="note">
-          実ゲームの <code>.psb</code> を、このリポジトリのクリーンルーム実装
-          （PSB → VAR/pose → draw list → CPU raster）で描画しています。
+          実ゲームの <code>.psb</code> を、公開実装（eluna / FreeMote など）を
+          参考にしたこのリポジトリの Rust 実装（PSB → VAR/pose → draw list →
+          CPU raster）で描画しています。
           <kbd>←</kbd><kbd>→</kbd> 表情、<kbd>↑</kbd><kbd>↓</kbd> キャラクター。
         </div>
       </div>
@@ -280,9 +366,12 @@ const MODELS = {data_json};
 const modelsEl = document.getElementById('models');
 const posesEl = document.getElementById('poses');
 const view = document.getElementById('view');
+const viewNext = document.getElementById('view-next');
+const animEl = document.getElementById('anim');
+let front = view;
 const nameEl = document.getElementById('pose-name');
 const varsEl = document.getElementById('pose-vars');
-let mi = 0, pi = 0, playing = false, frame = 0, timer = null;
+let mi = 0, pi = 0, playing = false, timer = null;
 
 MODELS.forEach((model, i) => {{
   const button = document.createElement('button');
@@ -319,11 +408,18 @@ function updateStats(model) {{
 }}
 
 function setImage(src, label, vars) {{
-  view.classList.add('swap');
-  setTimeout(() => {{
-    view.src = src;
-    view.classList.remove('swap');
-  }}, 80);
+  view.style.display = 'block';
+  viewNext.style.display = 'block';
+  animEl.style.display = 'none';
+  const incoming = front === view ? viewNext : view;
+  const outgoing = front === view ? view : viewNext;
+  incoming.onload = () => {{
+    incoming.style.opacity = 1;
+    outgoing.style.opacity = 0;
+    front = incoming;
+    incoming.onload = null;
+  }};
+  incoming.src = src;
   nameEl.textContent = label;
   varsEl.textContent = vars;
 }}
@@ -344,32 +440,34 @@ function select(modelIndex, poseIndex) {{
 
 function startLive() {{
   const model = MODELS[mi];
-  if (!model.anim.length) {{
+  if (!model.video) {{
     varsEl.textContent = 'このモデルには待機ループがありません';
     return;
   }}
   stopLive();
   playing = true;
-  frame = 0;
   [...modelsEl.children].forEach((el, i) => el.classList.toggle('active', i === mi));
   [...posesEl.children].forEach((el, i) => el.classList.toggle('active', false));
   liveButton.classList.add('active');
-  const tick = () => {{
-    const current = MODELS[mi];
-    view.src = current.anim[frame % current.anim.length];
-    nameEl.textContent = current.label + ' · 待機ループ';
-    varsEl.textContent = 'timeline: 待機ループ00';
-  }};
-  tick();
-  timer = setInterval(() => {{
-    frame += 1;
-    tick();
-  }}, 150);
+  view.style.display = 'none';
+  viewNext.style.display = 'none';
+  animEl.style.display = 'block';
+  animEl.src = model.video;
+  animEl.currentTime = 0;
+  animEl.play().catch(() => {{
+    animEl.addEventListener('canplay', () => animEl.play().catch(() => {{}}), {{ once: true }});
+  }});
+  nameEl.textContent = model.label + ' · 待機ループ';
+  varsEl.textContent = 'timeline: 待機ループ00 · 60Hz engine / 30fps preview';
   updateStats(model);
 }}
 
 function stopLive() {{
   playing = false;
+  animEl.pause();
+  animEl.style.display = 'none';
+  view.style.display = 'block';
+  viewNext.style.display = 'block';
   if (timer !== null) {{
     clearInterval(timer);
     timer = null;

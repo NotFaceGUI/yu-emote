@@ -1,7 +1,8 @@
 # yu-emote
 
-Clean-room E-mote (EMT/PSB) runtime for YU-RIS, written in Rust and designed for
-native + `wasm32` use.
+E-mote (EMT/PSB) runtime for YU-RIS, written in Rust and designed for native +
+`wasm32` use. The runtime behavior is **referenced from the open-source E-mote
+reimplementations listed below**, not developed as a clean-room design.
 
 > E-mote is a 2D character-animation middleware by M2 Co., Ltd. This project is
 > not affiliated with M2. It only reads/writes E-mote data files.
@@ -17,20 +18,24 @@ native + `wasm32` use.
 | YU-RIS adapter: `EMOTE` params, `EMOTEINFO` queries, capability, suspend/dirty | ✅ |
 | Typed model schema: screen, atlas pages, objects/motions/layers/frames, variables, timelines, controllers (`psb-dump`) | ✅ M1 |
 | Atlas decoding (`RGBA4444`, `A4R4G4B4` order evidenced from the DLL) | ✅ M1 |
-| Deterministic variable/timeline state (`Animator`: PLAY/DPLAY/STOP, fades, looping) | ✅ M2 core (differential fade curve pending) |
-| Layer/frame evaluation, nested motions, motion-local parameter tables, motion-level `parameterize`, `priority` emission, resolved-Z draw order, native inheritance source (`0x400000`/motion root), sprite-mesh shape sync + `meshSyncChildMask` 0x1/0x2/0x4 + `meshCombinator` (`psb-pose`) | ✅ M2 core |
-| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG), native blend modes 0..5 + MODULATE2X | ✅ M3 baseline |
+| Deterministic timeline state (`Animator`: native 60 Hz command streams, transitions/easing exponents, authored loops, PLAY/DPLAY/STOP, differential fade) | ✅ M2 core |
+| Layer/frame evaluation, top-level easing table (`ccc/acc/zcc/scc/occ/wcc`) and `cp` Bezier paths, nested motions, parameter tables/`parameterize`, resolved-Z draw order, native inheritance source, sprite-mesh sync + `meshCombinator`, empty-mesh identity handling, type-7 clip, type-9 anchor | ✅ M2 core |
+| `Player`: timeline → controllers → pose → physics order; bust/hair/parts springs; clamp controls; deterministic eye blink | ✅ M2 core |
+| Render plan (`psb-plan`) + deterministic CPU rasterizer (`psb-render`, PNG), native blend modes 0..5 + MODULATE2X, type-7 clipping | ✅ M3 baseline |
+| Whole-timeline renderer (`psb-anim`) + 30 fps alpha-WebM demo clips | ✅ |
 | Composite alpha masks (`stencilType & 4` + `stencilCompositeMaskLayerList`, type-3 source expansion) in the CPU path | ✅ M3 core |
 | WGSL for all 58 official shader variants in [`shaders/`](shaders/) + cubic Bezier mesh tessellation | ✅ M3 core (wgpu pipeline pending) |
+| Remaining M2/M3 gaps: type-4 particles, type-10 feedback, inner/outer stencil phases, eyebrow/mouth graph queues, selectors, wind, pixelate, wgpu | ⏳ |
 | Pixel parity vs. official `YSEmote.dll` | ⏳ M4 |
 
 The renderer is usable today for real game data: the YU-RIS test model and
 four Nekopara maid models produce complete characters with correct
 rear-hair/face/front-hair layering and variable-driven expressions.
 [`demo/make_demo.py`](demo/make_demo.py) builds a self-contained character +
-expression + idle-loop demo page (`target/emote-demo/index.html`) from those
-models. Every pose and animation frame uses one fixed camera, so tilting or
-breathing never changes the character's apparent size.
+expression + full idle-loop demo page (`target/emote-demo/index.html`) from
+those models. The idle loop is rendered by `psb-anim` as a 30 fps VP9/WebM
+clip over the authored 421-tick (7 s) timeline. Every pose and animation frame
+uses one fixed camera, and expression switches cross-fade.
 
 ## Usage
 
@@ -185,23 +190,34 @@ assert_eq!(emote.capability(), Capability::DataOnly);
   `wasm32-unknown-unknown`. The official Windows DLL cannot run in wasm and is
   only used as an oracle.
 
-## Attribution and licensing
+## 参考实现与许可 / References and licensing
 
-Dual-licensed under **MIT OR Apache-2.0**.
+This project is **not clean-room**. It deliberately follows the recovered
+behavior and data interpretation of these open-source projects:
 
-- PSB/MDF binary parsing: [`emote-psb`](https://github.com/storycraft/emote-psb-rs)
-  by storycraft, MIT.
-- PSB body stream cipher schedule and single-DWORD key search: documented by
-  FreeMote and eluna; this repository contains an independent implementation
-  (no code copied).
-- Model normalization / part-table / wasm ABI concepts:
-  [`amadeus-emote-loader`](https://github.com/Mieluoxxx/amadeus-emote-loader),
-  Apache-2.0 (reference; no code copied in this milestone).
-- Behavior/oracle references only (no code): [`eluna`](https://github.com/xmoezzz/eluna)
-  (no license), [`FreeMote`](https://github.com/UlyssesWu/FreeMote) and its WebGL
-  runtime (CC BY-NC-SA 4.0).
+- [`eluna`](https://github.com/xmoezzz/eluna) (`eluna_rs`, **MPL-2.0**) —
+  the main behavioral reference for the native runtime: timeline command
+  streams, frame interpolation and easing, inheritance/mesh chains, composite
+  stencils, clamp/eye/mouth controllers, physics equations and the type-7/anchor
+  passes. The Rust code in this repository is written for this project, but its
+  algorithms and constants are adapted from eluna, and the module headers say
+  so. eluna is pinned at commit `9a00029` for the facts cited here.
+- [`FreeMote`](https://github.com/UlyssesWu/FreeMote) and its WebGL runtime
+  (**CC BY-NC-SA 4.0**) — PSB/atlas format facts and a visual oracle. No
+  FreeMote code is incorporated; it is **not** used for commercial licensing.
+- [`emote-psb`](https://github.com/storycraft/emote-psb-rs) by storycraft
+  (**MIT**) — the PSB/MDF binary parser dependency.
+- [`amadeus-emote-loader`](https://github.com/Mieluoxxx/amadeus-emote-loader)
+  (**Apache-2.0**) — model normalization and wasm ABI concepts.
 
-See `NOTICE` for details.
+The project as a whole is distributed under **MIT OR Apache-2.0**. The eluna
+project is MPL-2.0; if you redistribute a modified version of a module that
+contains adapted eluna logic, keep the MPL-2.0 notice for that module and make
+its source available. See `NOTICE` for per-project attribution and the full
+list of referenced files.
+
+The official `YSEmote.dll` / `emotedriver.dll` are used only as an
+interoperability oracle; no official code or shader source is copied.
 
 ## Related
 
