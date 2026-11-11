@@ -35,6 +35,8 @@
 │  texture   RGBA4444 / 32-bpp spec order / RL / PNG decode        │
 │  plan      sprite scene -> textured triangle draw list           │
 │  soft      deterministic CPU rasterizer (blends, clip, masks)    │
+│  gpu       wgpu backend on a host-owned device                   │
+│  player    official IEmoteDevice/IEmotePlayer-shaped facade      │
 │  yuris     EMOTE/EMOTEINFO, capability, suspend, dirty           │
 │  bins      psb-info, psb-dump, psb-key-search, render, anim      │
 └──────────────────────────────────────────────────────────────────┘
@@ -44,6 +46,12 @@
 world transforms, mesh patches and `DrawFrameInfo` produced by eluna, so the
 runtime semantics (transitions, loops, joins, physics) are shared with the
 reference implementation.
+
+`player` is the host-facing layer: it keeps the official method vocabulary
+(`Show`, `SetCoord`, `SetVariable`, `PlayTimeline`, `Progress`, `Render`) over
+`Emote` + `GpuRenderer`, applies the official player transform to the view,
+and publishes an explicit support ledger for methods that are state-only or
+unimplemented. See [`official-api.md`](official-api.md).
 
 ## YU-RIS glue: suspension and optimization
 
@@ -147,10 +155,12 @@ stack.
   physics, clamp/eye/selectors. `psb-anim` starts authored loops at `loopBegin`
   and can settle complete loops before recording.
 - **M3 (renderer bridge done)** scene → draw plan, native blends, MODULATE2X,
-  clip, wipe, inner masks, PNG/WebM output. Static-frame parity against
-  `eluna_player` is ~0.3/255 mean absolute RGB error (edge/gamma only).
-  Outstanding: outer stencil reference counting, particles, feedback,
-  stereovision, wgpu delivery.
+  clip, wipe, inner masks, PNG/WebM output, wgpu backend, and the
+  official-shaped `EmoteDevice`/`EmotePlayer` host facade
+  (`docs/official-api.md`). Static-frame parity against `eluna_player` is
+  ~0.3/255 mean absolute RGB error (edge/gamma only). Outstanding: outer
+  stencil reference counting, particles, feedback, stereovision composition,
+  timed color/grayscale, pixelate.
 - **M4** parity against official `YSEmote.dll` screenshots with declared
   per-channel thresholds.
 

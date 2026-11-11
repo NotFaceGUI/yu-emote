@@ -19,6 +19,8 @@ src/runtime.rs       load/drive wrapper around eluna::EmoteRuntime
 src/texture.rs       RGBA4444 / 32-bpp / RL / PNG texture decoding
 src/plan.rs          evaluated scene -> textured triangle draw plan
 src/soft.rs          deterministic CPU rasterizer (blends, clip, inner masks)
+src/gpu.rs           wgpu backend on the kernel's shared device
+src/player.rs        official IEmoteDevice/IEmotePlayer-shaped host facade
 src/yuris.rs         YU-RIS EMOTE/EMOTEINFO adapter state
 src/bin/*            psb-info, psb-dump, psb-key-search, psb-render, psb-anim
 ```
@@ -27,7 +29,10 @@ There is no second, project-local animation implementation. Scene evaluation,
 timeline command streams, transitions, loops, physics and masks all come from
 `eluna::EmoteRuntime`. See `vendor/eluna/PROVENANCE.md` for the upstream commit
 and the single local PSB v4 parsing fix. The kernel handoff contract is in
-[`docs/yuris-host.md`](docs/yuris-host.md).
+[`docs/yuris-host.md`](docs/yuris-host.md); the official method mapping is in
+[`docs/official-api.md`](docs/official-api.md). The 2026-11-11 correctness/
+performance review is in
+[`docs/review-2026-11-11.md`](docs/review-2026-11-11.md).
 
 ## Status
 
@@ -42,6 +47,7 @@ and the single local PSB v4 parsing fix. The kernel handoff contract is in
 | Draw plan + CPU rasterizer: native blends 0..5, MODULATE2X, clip, wipe, inner masks | ✅ |
 | Parallel CPU rasterizer (16 bands, incremental edges, deterministic across thread counts) | ✅ validation/reference |
 | wgpu backend (`Rgba8Unorm`, shared device, native blends, masks, clip/wipe) | ✅ |
+| Official-shaped `EmoteDevice`/`EmotePlayer` facade (device/player methods, timed transforms, support ledger) | ✅ |
 | CLI: info/dump/key search/render/timeline PNG sequence/benchmark/GPU | ✅ |
 | Demo: 4 real models, expressions, 30 fps alpha-WebM idle loop + one-shot gesture | ✅ |
 | Outer-stencil reference counting, type-4 particles, type-10 feedback, stereovision in the CPU/GPU renderers | ⏳ |
@@ -75,11 +81,35 @@ cargo run --release --bin psb-render -- model.psb --timeline 待機ループ00 -
 # Timeline to PNG sequence (native 60 Hz stepping, fixed camera)
 cargo run --release --bin psb-anim -- model.psb --timeline 待機ループ00 \
   --fps 30 --seconds 7 --out-dir frames
+
+# Official-shaped player loop (CPU or --gpu headless), one frame to PNG
+cargo run --release --bin psb-player -- model.psb --timeline 待機ループ00 \
+  --ticks 120 --canvas 800x600 --out frame.png
+cargo run --release --bin psb-player -- model.psb --gpu --out frame.png
 ```
 
 `--view SCALE,X,Y` pins the camera so every frame/pose of a clip shares the same
 transform. Without it, the first rendered frame is fitted into `--canvas WxH`
 (default `900x1400`) with `--margin` (default 20 px).
+
+For host integration, the official `IEmoteDevice`/`IEmotePlayer` shape is kept
+by `EmoteDevice`/`EmotePlayer`:
+
+```rust
+use yu_emote::{EmoteDevice, EmoteDeviceOptions};
+
+let mut device = EmoteDevice::new(gpu.device.clone(), gpu.queue.clone(), EmoteDeviceOptions::default())?;
+device.set_screen_rect(800, 600);
+let mut player = device.create_player(&psb_bytes, key, None)?;
+
+player.show();
+player.set_variable("BUST", 128.0)?;
+player.play_timeline("待機ループ00", 0)?;
+player.progress(1.0)?;
+
+let frame = player.render()?; // wgpu::TextureView, Rgba8Unorm
+// hand frame.view to the compositor at the E-mote layer
+```
 
 The per-game E-mote key is **never** hard-coded in the library. CLI tools take
 `--key`; tests take `YURIS_EMOTE_KEY`. Do not commit a game key or game assets.

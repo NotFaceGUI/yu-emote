@@ -76,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 view = Some(soft::ViewTransform {
                     scale: parse_num(parts[0])?,
+                    rotation: 0.0,
                     offset: [parse_num(parts[1])?, parse_num(parts[2])?],
                 });
             }

@@ -39,6 +39,12 @@ texture bit layout, key-string location, stdcall ABI) were obtained by
 inspecting the shipped SDK 0.495 `YSEmote.dll`/`emotedriver.dll` for
 interoperability. No official code or shader source was copied.
 
+The `IEmoteDevice`/`IEmotePlayer` method names and argument order in
+`src/player.rs` follow the public auto-generated `iemote.h` interface header
+distributed with the E-mote SDK (mirrored in Project-AZUSA/FreeMote-SDK). It is
+used as an interface reference only; no implementation code is copied. The
+implementation is this project's own over the vendored `eluna` runtime.
+
 Game assets used for local verification (the YU-RIS sample and the Nekopara
 `*.pure.psb` files mirrored by Chocola-X/NekoWebShow) remain the property of
 their respective rights holders. They are not included in this repository, its

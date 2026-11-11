@@ -106,14 +106,22 @@ impl Emote {
         self.runtime.variable_values()
     }
 
-    /// Apply immediate variable writes and rebuild after each write.
+    /// Apply immediate variable writes and rebuild the scene once.
     ///
     /// `set_variable` only changes the transition target; the renderer needs
-    /// the evaluated value now, so use the immediate path.
+    /// the evaluated value now, so use the immediate path. The inner player
+    /// applies each value immediately; the scene is rebuilt after the whole
+    /// batch instead of once per variable.
     pub fn set_variables(&mut self, values: &BTreeMap<String, f64>) -> Result<(), EmoteError> {
-        for (name, value) in values {
-            self.runtime.set_variable_immediate(name, *value as f32)?;
+        if values.is_empty() {
+            return Ok(());
         }
+        for (name, value) in values {
+            self.runtime
+                .inner_player_mut()
+                .set_variable_immediate(name, *value as f32);
+        }
+        self.runtime.rebuild_scene()?;
         Ok(())
     }
 

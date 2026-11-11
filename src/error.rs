@@ -88,6 +88,10 @@ pub enum EmoteError {
     #[error("unsupported EMOTEINFO field `{0}`")]
     UnsupportedInfo(String),
 
+    /// An official SDK method exists but is not implemented by this backend.
+    #[error("unsupported official API feature: {0}")]
+    UnsupportedFeature(&'static str),
+
     /// The adapter is not allowed to advance animation yet.
     #[error("E-mote runtime is not ready (capability: {0})")]
     NotReady(crate::yuris::Capability),

@@ -133,3 +133,88 @@ fn gpu_matches_cpu_and_applies_inner_mask() {
     }
     assert!(diff < 4000, "cpu/gpu differ too much: {diff}");
 }
+
+#[test]
+fn gpu_applies_presentation_rotation() {
+    let plan = RenderPlan {
+        width: 8,
+        height: 8,
+        items: vec![item(
+            0,
+            EmoteDrawPass::Normal,
+            Vec::new(),
+            (2.0, 2.0, 6.0, 6.0),
+        )],
+        mask_groups: Vec::new(),
+        skipped: BTreeMap::new(),
+    };
+    let mut textures = BTreeMap::new();
+    textures.insert(0, solid([255, 0, 0, 255]));
+    // Rotate the 4x4 square 45 degrees around its center (4,4).
+    let view = ViewTransform::player([4.0, 4.0], [4.0, 4.0], 1.0, std::f32::consts::FRAC_PI_4);
+
+    let (cpu, _) = soft::render_with_textures(&plan, &textures, view).expect("cpu render");
+    let pixel = |data: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let index = (y * 8 + x) * 4;
+        [
+            data[index],
+            data[index + 1],
+            data[index + 2],
+            data[index + 3],
+        ]
+    };
+    // Center stays covered; the axis-aligned corner of the original square is
+    // outside the rotated diamond.
+    assert_eq!(pixel(&cpu.rgba8, 4, 4), [255, 0, 0, 255]);
+    assert_eq!(pixel(&cpu.rgba8, 2, 2), [0, 0, 0, 0]);
+
+    let Ok((mut gpu, _adapter)) = GpuRenderer::headless() else {
+        eprintln!("SKIP: no wgpu adapter");
+        return;
+    };
+    let frame = gpu.render(&plan, &textures, view).expect("gpu render");
+    let rgba = gpu.read_frame(&frame).expect("gpu readback");
+    assert_eq!(pixel(&rgba, 4, 4), [255, 0, 0, 255]);
+    assert_eq!(pixel(&rgba, 2, 2), [0, 0, 0, 0]);
+}
+
+#[test]
+fn rotated_clip_uses_model_space_rectangle() {
+    let mut draw = item(0, EmoteDrawPass::Normal, Vec::new(), (0.0, 0.0, 8.0, 8.0));
+    draw.clip_rect = Some([2.0, 2.0, 6.0, 6.0]);
+    let plan = RenderPlan {
+        width: 8,
+        height: 8,
+        items: vec![draw],
+        mask_groups: Vec::new(),
+        skipped: BTreeMap::new(),
+    };
+    let mut textures = BTreeMap::new();
+    textures.insert(0, solid([255, 0, 0, 255]));
+    let view = ViewTransform::player([4.0, 4.0], [4.0, 4.0], 1.0, std::f32::consts::FRAC_PI_4);
+    let pixel = |data: &[u8], x: usize, y: usize| -> [u8; 4] {
+        let index = (y * 8 + x) * 4;
+        [
+            data[index],
+            data[index + 1],
+            data[index + 2],
+            data[index + 3],
+        ]
+    };
+
+    let (cpu, _) = soft::render_with_textures(&plan, &textures, view).expect("cpu render");
+    // The clip is the model-space square 2..6; after rotation it is a diamond.
+    // (2,2) is inside the screen-space AABB but outside the diamond, so the
+    // CPU path must not paint it.
+    assert_eq!(pixel(&cpu.rgba8, 4, 4), [255, 0, 0, 255]);
+    assert_eq!(pixel(&cpu.rgba8, 2, 2), [0, 0, 0, 0]);
+
+    let Ok((mut gpu, _adapter)) = GpuRenderer::headless() else {
+        eprintln!("SKIP: no wgpu adapter");
+        return;
+    };
+    let frame = gpu.render(&plan, &textures, view).expect("gpu render");
+    let rgba = gpu.read_frame(&frame).expect("gpu readback");
+    assert_eq!(pixel(&rgba, 4, 4), [255, 0, 0, 255]);
+    assert_eq!(pixel(&rgba, 2, 2), [0, 0, 0, 0]);
+}

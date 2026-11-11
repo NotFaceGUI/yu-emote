@@ -4,6 +4,55 @@ This is the contract for wiring `yu-emote` into the YU-RIS kernel. The kernel's
 M0 decision is **RGBA texture + layer transform**, not a new `Op::Emote`; this
 document describes that path.
 
+The official `IEmoteDevice`/`IEmotePlayer` method shape is preserved by the
+[`player`](official-api.md) facade. Use it for new host code; the lower-level
+`Emote` + `GpuRenderer` path below stays available for tools that already own
+the model/plan.
+
+## Recommended: official-shaped device/player
+
+```rust
+use yu_emote::{EmoteDevice, EmoteDeviceOptions};
+
+// Once, on the kernel's existing wgpu device:
+let mut emote_device = EmoteDevice::new(
+    ctx.device.clone(),
+    ctx.queue.clone(),
+    EmoteDeviceOptions { screen: [800, 600], ..Default::default() },
+)?;
+
+// Per character:
+let mut emote = emote_device.create_player(&psb_bytes, key, None)?;
+emote.set_canvas(viewport_w, viewport_h);
+// M0 path: leave the outer view unset and let the compositor place this
+// texture. `set_view` is for rendering directly into final screen space.
+emote.play_timeline("待機ループ00", 0)?;
+// Optional: textures are already uploaded; drop the CPU copies.
+emote.release_decoded_textures();
+
+// Per frame:
+emote.progress(delta_seconds * 60.0)?;
+if emote.is_modified() {
+    let frame = emote.render()?; // wgpu::TextureView over Rgba8Unorm
+    // composite frame.view with the E-mote layer transform
+    emote.clear_modified();
+}
+```
+
+The player exposes the official vocabulary (`show`/`hide`, `set_coord`,
+`set_scale`, `set_rot`, `set_variable`, `play_timeline`, `progress`,
+`render`, ...). `EmoteDevice::capability()` is `Capability::Ready`. See
+[`official-api.md`](official-api.md) for the complete mapping and the
+explicitly unsupported methods.
+
+`EmotePlayer` uploads textures during creation. GPU-only hosts can call
+`player.release_decoded_textures()` immediately afterwards to drop the CPU
+copies; `render()` keeps working, `render_cpu()` then returns
+`UnsupportedFeature`. Each player currently owns its renderer state
+(pipelines/target/buffers), so multi-character sessions should create players
+off the critical path and budget accordingly. `docs/review-2026-11-11.md`
+tracks the shared-context and PSB-copy optimizations.
+
 ## Device sharing
 
 The kernel already owns `yu-render/wgpu`'s `GpuContext`. Construct the E-mote
@@ -58,8 +107,14 @@ let frame = emote_gpu.render(&plan, &textures, view)?;
 `view` maps model pixels to the E-mote target texture:
 
 ```rust
-let view = soft::ViewTransform { scale, offset };
+let view = soft::ViewTransform { scale, rotation: 0.0, offset };
 ```
+
+`rotation` is in radians. `ViewTransform::player(center, coord, scale, rot)`
+builds the official player transform, and `ViewTransform::compose` folds it
+under a host camera. `EmotePlayer::set_view(Some(view))` installs a
+**screen-space** outer camera applied after the player transform; it is not a
+model-space fit. Leave it `None` for the fixed fit camera.
 
 Choose the canvas to match the character's on-screen rectangle. Rendering a
 full 800×600 target is fine; a tight character-sized target is cheaper and the
@@ -90,14 +145,15 @@ The VM emits `Domain::Emote` with named arguments. The host adapter should map:
 
 | Input | Runtime call |
 |---|---|
-| numeric `BUST`/`HAIR`/`PARTS`/... | `set_variable_timed(name, value, time * 0.06 * 60, easing)` |
+| numeric `BUST`/`HAIR`/`PARTS`/... | `set_variable_timed(name, value, time * 0.06, easing)?` |
 | string timeline/motion name | `play_timeline(name, mode)` |
 | visible/flag | `runtime.show()/hide()` or the SDK visibility slot |
 | unknown name | record, do not guess |
 | `EMOTEINFO` | query through the runtime; unknown fields stay explicit |
 
-`time * 0.06` is seconds (`domain-event-contracts.md` §7.3); multiply by 60 for
-the runtime's native tick unit.
+`EMOTE`'s `TIME` is milliseconds. The official handler converts it with
+`× 0.06` (`60/1000`) before calling the player, so `time * 0.06` is already in
+the runtime's native 1/60-second tick unit. Do not multiply by 60 again.
 
 ## Threading and stack
 

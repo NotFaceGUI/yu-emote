@@ -35,6 +35,34 @@ use crate::texture::DecodedTexture;
 /// Target format used by the kernel and this renderer.
 pub const TARGET_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Create a standalone wgpu context for headless CLI/tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn headless_context()
+-> Result<(wgpu::Instance, wgpu::Device, wgpu::Queue, wgpu::AdapterInfo), EmoteError> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::PRIMARY,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+        apply_limit_buckets: false,
+    }))
+    .map_err(|error| EmoteError::Gpu(format!("request_adapter: {error}")))?;
+    let info = adapter.get_info();
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("yu-emote device"),
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|error| EmoteError::Gpu(format!("request_device: {error}")))?;
+    Ok((instance, device, queue, info))
+}
+
 const SHADER: &str = include_str!("../shaders/gpu/emote.wgsl");
 
 /// GPU frame statistics.
@@ -74,7 +102,7 @@ struct ViewUniform {
     scale: [f32; 2],
     offset: [f32; 2],
     size: [f32; 2],
-    _pad: [f32; 2],
+    rotation: [f32; 2],
 }
 
 #[repr(C)]
@@ -289,30 +317,20 @@ impl GpuRenderer {
     /// use [`GpuRenderer::new`] with its own device instead.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn headless() -> Result<(Self, wgpu::AdapterInfo), EmoteError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|error| EmoteError::Gpu(format!("request_adapter: {error}")))?;
-        let info = adapter.get_info();
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("yu-emote device"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|error| EmoteError::Gpu(format!("request_device: {error}")))?;
+        let (instance, device, queue, info) = headless_context()?;
         let mut renderer = Self::new(device, queue);
         renderer._instance = Some(instance);
         Ok((renderer, info))
+    }
+
+    /// The device this renderer was built on.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The queue this renderer submits to.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 
     /// Upload decoded textures once per model. Existing resources are kept.
@@ -378,17 +396,31 @@ impl GpuRenderer {
         view: ViewTransform,
     ) -> Result<GpuFrame, EmoteError> {
         self.upload_textures(textures)?;
+        self.render_uploaded(plan, view)
+    }
+
+    /// Render a plan using only textures already uploaded to this renderer.
+    ///
+    /// This is the low-memory path: a host can upload once, release the
+    /// decoded CPU copies, and keep rendering. Resource presence is taken from
+    /// the renderer's uploaded texture table.
+    pub fn render_uploaded(
+        &mut self,
+        plan: &RenderPlan,
+        view: ViewTransform,
+    ) -> Result<GpuFrame, EmoteError> {
         let width = plan.width.max(1);
         let height = plan.height.max(1);
-        let scene = build_scene(plan, textures);
+        let scene = build_scene(plan, &self.textures);
         self.ensure_target(width, height)?;
         self.ensure_buffers(&scene.vertices, &scene.indices);
 
+        let (sin, cos) = view.rotation.sin_cos();
         let uniform = ViewUniform {
             scale: [view.scale, view.scale],
             offset: view.offset,
             size: [width as f32, height as f32],
-            _pad: [0.0; 2],
+            rotation: [cos, sin],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
@@ -419,7 +451,10 @@ impl GpuRenderer {
             if !color_item(item) {
                 continue;
             }
-            if item.resource.is_none() || item_texture(item, textures).is_none() {
+            if item
+                .resource
+                .is_none_or(|resource| !self.textures.contains_key(&resource))
+            {
                 continue;
             }
             for &group in &item.mask_groups {
@@ -793,19 +828,19 @@ impl GpuRenderer {
     }
 }
 
-fn build_scene(plan: &RenderPlan, textures: &BTreeMap<u32, DecodedTexture>) -> Scene {
+fn build_scene(plan: &RenderPlan, textures: &BTreeMap<u32, TextureEntry>) -> Scene {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     let mut ranges = Vec::new();
     let mut stats = GpuStats::default();
     for (item_index, item) in plan.items.iter().enumerate() {
-        if item.resource.is_none() {
+        let Some(resource) = item.resource else {
             if color_item(item) {
                 stats.skipped_feedback += 1;
             }
             continue;
-        }
-        if item_texture(item, textures).is_none() {
+        };
+        if !textures.contains_key(&resource) {
             if color_item(item) {
                 stats.missing_textures += 1;
             }
@@ -855,13 +890,6 @@ fn color_item(item: &DrawItem) -> bool {
         item.pass,
         crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
     )
-}
-
-fn item_texture<'a>(
-    item: &DrawItem,
-    textures: &'a BTreeMap<u32, DecodedTexture>,
-) -> Option<&'a DecodedTexture> {
-    item.resource.and_then(|resource| textures.get(&resource))
 }
 
 fn native_blend_state(mode: u32) -> wgpu::BlendState {

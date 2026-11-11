@@ -2,7 +2,8 @@ struct View {
     scale: vec2<f32>,
     offset: vec2<f32>,
     size: vec2<f32>,
-    _pad: vec2<f32>,
+    // (cos, sin) of the presentation rotation.
+    rotation: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> view: View;
@@ -33,7 +34,11 @@ struct VsOut {
 
 @vertex
 fn vs_main(input: VsIn) -> VsOut {
-    let screen = input.position * view.scale + view.offset;
+    let scaled = input.position * view.scale;
+    let screen = vec2<f32>(
+        scaled.x * view.rotation.x - scaled.y * view.rotation.y,
+        scaled.x * view.rotation.y + scaled.y * view.rotation.x,
+    ) + view.offset;
     let ndc = vec2<f32>(
         screen.x / view.size.x * 2.0 - 1.0,
         1.0 - screen.y / view.size.y * 2.0,

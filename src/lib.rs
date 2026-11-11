@@ -12,6 +12,9 @@
 //! - [`texture`]: `RGBA4444` / 32-bpp / RL texture decoding;
 //! - [`plan`]: evaluated scene → textured triangle draw plan;
 //! - [`soft`]: deterministic CPU rasterizer used for screenshots and the demo;
+//! - [`gpu`]: wgpu backend on a host-owned device;
+//! - [`player`]: official `IEmoteDevice`/`IEmotePlayer`-shaped facade for the
+//!   YU-RIS kernel (device/player state, timelines, progress, render);
 //! - [`yuris`]: YU-RIS `EMOTE` parameter recording, capability reporting,
 //!   suspension and dirty-frame tracking.
 //!
@@ -49,6 +52,7 @@
 pub mod error;
 pub mod gpu;
 pub mod plan;
+pub mod player;
 pub mod psb;
 pub mod runtime;
 pub mod soft;
@@ -59,6 +63,11 @@ pub use eluna;
 pub use error::EmoteError;
 pub use gpu::{GpuFrame, GpuRenderer, GpuStats};
 pub use plan::{DrawItem, MaskGroup, PlanVertex, RenderPlan};
+pub use player::{
+    EmoteDevice, EmoteDeviceOptions, EmoteMaskMode, EmotePlayer, EmotePlayerOptions,
+    OFFICIAL_API_SUPPORT, OFFICIAL_INTERFACE_VERSION, OfficialApiSupport, OfficialSupport,
+    ShaderModel, official_api_support,
+};
 pub use psb::{PsbDocument, PsbFile, PsbValue};
 pub use runtime::{
     EMOTE_TICKS_PER_SECOND, ElunaPlayer, Emote, EmoteDrawPass, EmoteMeshPatch, EmoteStaticSprite,

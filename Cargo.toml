@@ -41,6 +41,10 @@ name = "psb-render"
 path = "src/bin/psb-render.rs"
 
 [[bin]]
+name = "psb-player"
+path = "src/bin/psb-player.rs"
+
+[[bin]]
 name = "psb-anim"
 path = "src/bin/psb-anim.rs"
 

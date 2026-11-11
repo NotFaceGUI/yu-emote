@@ -8,9 +8,12 @@
 //!
 //! - `EMOTE` observed parameters in the ERIS corpus: `BUST`, `HAIR`, `PARTS`,
 //!   `SMOOTH` (numeric). Unknown parameters are recorded, not guessed.
-//! - `EMOTEINFO` field semantics are **not** evidenced yet; queries for
-//!   anything outside the recorded numeric set return
-//!   [`EmoteError::UnsupportedInfo`] instead of inventing a value.
+//! - `EMOTEINFO` fields observed in the official ERIS wrappers: `ANIMATION`
+//!   (is the player animating), `LABEL` + `PLAY` (is that timeline playing) and
+//!   `DATA` (host-owned E-mote data ID). The host adapter maps those to
+//!   [`crate::EmotePlayer`] queries; this module's numeric `query_info` remains
+//!   limited to the evidenced variable set and returns
+//!   [`EmoteError::UnsupportedInfo`] for anything else.
 //! - `SYSTEMINFO[EMOTE]` is a capability bit. [`Capability::Ready`] means the
 //!   vendored runtime and renderer are linked; [`Capability::DataOnly`] keeps
 //!   scripted animation disabled while still allowing inspection.

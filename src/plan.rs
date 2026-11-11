@@ -99,6 +99,17 @@ pub struct RenderPlan {
 }
 
 impl RenderPlan {
+    /// An empty plan for a canvas (hidden players, cleared frames).
+    pub fn empty(canvas: [u32; 2]) -> Self {
+        Self {
+            width: canvas[0].max(1),
+            height: canvas[1].max(1),
+            items: Vec::new(),
+            mask_groups: Vec::new(),
+            skipped: BTreeMap::new(),
+        }
+    }
+
     /// Build a plan from an evaluated `eluna` scene.
     ///
     /// `canvas` is the output size used by [`crate::soft::ViewTransform::fit`].

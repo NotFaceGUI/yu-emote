@@ -134,10 +134,18 @@ pub struct SoftStats {
 }
 
 /// Presentation transform applied to plan vertices before rasterization.
+///
+/// This is the same affine shape as the official player transform:
+/// `screen = rotate(model * scale) + offset`. The rotation is expressed in
+/// radians and is applied after the uniform scale, matching the reference
+/// renderer's `(position - center) * player_scale -> rotate -> + coord` order
+/// once the center term has been folded into `offset`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ViewTransform {
     /// Uniform scale.
     pub scale: f32,
+    /// Rotation in radians (clockwise in screen coordinates).
+    pub rotation: f32,
     /// Translation in output pixels.
     pub offset: [f32; 2],
 }
@@ -153,8 +161,48 @@ impl ViewTransform {
     pub const fn identity() -> Self {
         Self {
             scale: 1.0,
+            rotation: 0.0,
             offset: [0.0, 0.0],
         }
+    }
+
+    /// Official player transform: scale/rotate around `center`, then translate
+    /// by `coord`. This is the position half of the official
+    /// `IEmotePlayer` transform (`player_scale` + `player_rot` + `coord`).
+    pub fn player(center: [f32; 2], coord: [f32; 2], scale: f32, rotation_radians: f32) -> Self {
+        let (sin, cos) = rotation_radians.sin_cos();
+        let cx = center[0] * scale;
+        let cy = center[1] * scale;
+        Self {
+            scale,
+            rotation: rotation_radians,
+            offset: [
+                coord[0] - (cx * cos - cy * sin),
+                coord[1] - (cx * sin + cy * cos),
+            ],
+        }
+    }
+
+    /// Compose two transforms: apply `self` first, then `outer`.
+    ///
+    /// Both transforms are uniform-scale + rotation + translation, so the
+    /// result stays in the same family.
+    pub fn compose(self, outer: Self) -> Self {
+        let scaled = [self.offset[0] * outer.scale, self.offset[1] * outer.scale];
+        let translated = outer.apply_unscaled(scaled);
+        Self {
+            scale: self.scale * outer.scale,
+            rotation: self.rotation + outer.rotation,
+            offset: translated,
+        }
+    }
+
+    fn apply_unscaled(self, point: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.rotation.sin_cos();
+        [
+            point[0] * cos - point[1] * sin + self.offset[0],
+            point[0] * sin + point[1] * cos + self.offset[1],
+        ]
     }
 
     /// Fit the plan bounds into the output with a pixel margin.
@@ -162,15 +210,14 @@ impl ViewTransform {
         let Some((min, max)) = plan.bounds() else {
             return Self::identity();
         };
-        let width = (max[0] - min[0]).max(1.0);
-        let height = (max[1] - min[1]).max(1.0);
-        let available_w = (plan.width.max(1) as f32 - margin * 2.0).max(1.0);
-        let available_h = (plan.height.max(1) as f32 - margin * 2.0).max(1.0);
-        let scale = (available_w / width).min(available_h / height);
+        let Some(scale) = fit_scale(plan, margin) else {
+            return Self::identity();
+        };
         let center_x = (min[0] + max[0]) * 0.5;
         let center_y = (min[1] + max[1]) * 0.5;
         Self {
             scale,
+            rotation: 0.0,
             offset: [
                 plan.width as f32 * 0.5 - center_x * scale,
                 plan.height as f32 * 0.5 - center_y * scale,
@@ -178,25 +225,98 @@ impl ViewTransform {
         }
     }
 
+    /// Fit scale and viewport centering for an official player transform.
+    ///
+    /// Unlike [`Self::fit`], the offset is the canvas center without a
+    /// model-space centering term. The player transform already subtracts the
+    /// model center; the official host applies `viewport_scale` and NDC
+    /// centering after it. Composing [`ViewTransform::player`] with this
+    /// camera reproduces `((p - center) * player_scale rotated + coord) * fit
+    /// + canvas_center`.
+    pub fn fit_camera(plan: &RenderPlan, margin: f32) -> Self {
+        let Some(scale) = fit_scale(plan, margin) else {
+            return Self::identity();
+        };
+        Self {
+            scale,
+            rotation: 0.0,
+            offset: [plan.width as f32 * 0.5, plan.height as f32 * 0.5],
+        }
+    }
+
     /// Apply to a model-space point.
     pub fn apply(self, point: [f32; 2]) -> [f32; 2] {
+        let (sin, cos) = self.rotation.sin_cos();
+        let x = point[0] * self.scale;
+        let y = point[1] * self.scale;
         [
-            point[0] * self.scale + self.offset[0],
-            point[1] * self.scale + self.offset[1],
+            x * cos - y * sin + self.offset[0],
+            x * sin + y * cos + self.offset[1],
         ]
     }
 }
 
-fn screen_clip(rect: Option<[f32; 4]>, view: ViewTransform) -> Option<[f32; 4]> {
+/// `ViewTransform` with the rotation trig evaluated once per frame.
+#[derive(Clone, Copy)]
+struct PreparedView {
+    scale: f32,
+    sin: f32,
+    cos: f32,
+    offset: [f32; 2],
+}
+
+impl From<ViewTransform> for PreparedView {
+    fn from(view: ViewTransform) -> Self {
+        let (sin, cos) = view.rotation.sin_cos();
+        Self {
+            scale: view.scale,
+            sin,
+            cos,
+            offset: view.offset,
+        }
+    }
+}
+
+impl PreparedView {
+    #[inline]
+    fn apply(self, point: [f32; 2]) -> [f32; 2] {
+        let x = point[0] * self.scale;
+        let y = point[1] * self.scale;
+        [
+            x * self.cos - y * self.sin + self.offset[0],
+            x * self.sin + y * self.cos + self.offset[1],
+        ]
+    }
+}
+
+fn fit_scale(plan: &RenderPlan, margin: f32) -> Option<f32> {
+    let (min, max) = plan.bounds()?;
+    let width = (max[0] - min[0]).max(1.0);
+    let height = (max[1] - min[1]).max(1.0);
+    let available_w = (plan.width.max(1) as f32 - margin * 2.0).max(1.0);
+    let available_h = (plan.height.max(1) as f32 - margin * 2.0).max(1.0);
+    Some((available_w / width).min(available_h / height))
+}
+
+fn screen_clip(rect: Option<[f32; 4]>, view: PreparedView) -> Option<[f32; 4]> {
     let rect = rect?;
-    let a = view.apply([rect[0], rect[1]]);
-    let b = view.apply([rect[2], rect[3]]);
-    Some([
-        a[0].min(b[0]),
-        a[1].min(b[1]),
-        a[0].max(b[0]),
-        a[1].max(b[1]),
-    ])
+    // A rotated rectangle is no longer axis-aligned, so transform all four
+    // corners and keep the screen-space AABB.
+    let corners = [
+        view.apply([rect[0], rect[1]]),
+        view.apply([rect[2], rect[1]]),
+        view.apply([rect[2], rect[3]]),
+        view.apply([rect[0], rect[3]]),
+    ];
+    let mut min = corners[0];
+    let mut max = corners[0];
+    for corner in &corners[1..] {
+        min[0] = min[0].min(corner[0]);
+        min[1] = min[1].min(corner[1]);
+        max[0] = max[0].max(corner[0]);
+        max[1] = max[1].max(corner[1]);
+    }
+    Some([min[0], min[1], max[0], max[1]])
 }
 
 fn color_item(item: &DrawItem) -> bool {
@@ -218,6 +338,7 @@ pub fn render_with_textures(
 ) -> Result<(RenderImage, SoftStats), EmoteError> {
     let width = plan.width.max(1);
     let height = plan.height.max(1);
+    let view = PreparedView::from(view);
     let mut rgba8 = vec![0u8; width as usize * height as usize * 4];
     let mut stats = collect_stats(plan, textures);
 
@@ -348,7 +469,7 @@ struct BandPlan {
 fn build_band_plans(
     plan: &RenderPlan,
     textures: &BTreeMap<u32, DecodedTexture>,
-    view: ViewTransform,
+    view: PreparedView,
     width: u32,
     height: u32,
     ranges: &[(u32, u32)],
@@ -395,17 +516,29 @@ fn build_source_groups(plan: &RenderPlan) -> Vec<Vec<usize>> {
 
 fn item_screen_y(
     item: &DrawItem,
-    view: ViewTransform,
+    view: PreparedView,
     width: u32,
     height: u32,
 ) -> Option<(f32, f32)> {
     let (local_min, local_max) = item.bounds?;
-    let a = view.apply(local_min);
-    let b = view.apply(local_max);
-    let min_x = a[0].min(b[0]);
-    let max_x = a[0].max(b[0]);
-    let min_y = a[1].min(b[1]);
-    let max_y = a[1].max(b[1]);
+    // Transform all four corners: with rotation, the two extreme model-space
+    // corners do not describe the screen-space extent.
+    let corners = [
+        view.apply([local_min[0], local_min[1]]),
+        view.apply([local_max[0], local_min[1]]),
+        view.apply([local_max[0], local_max[1]]),
+        view.apply([local_min[0], local_max[1]]),
+    ];
+    let mut min_x = corners[0][0];
+    let mut max_x = corners[0][0];
+    let mut min_y = corners[0][1];
+    let mut max_y = corners[0][1];
+    for corner in &corners[1..] {
+        min_x = min_x.min(corner[0]);
+        max_x = max_x.max(corner[0]);
+        min_y = min_y.min(corner[1]);
+        max_y = max_y.max(corner[1]);
+    }
     let min_x = min_x.max(0.0);
     let max_x = max_x.min(width as f32 - 1.0);
     let min_y = min_y.max(0.0);
@@ -420,7 +553,7 @@ fn render_band(
     y1: u32,
     plan: &RenderPlan,
     textures: &BTreeMap<u32, DecodedTexture>,
-    view: ViewTransform,
+    view: PreparedView,
     width: u32,
     height: u32,
     source_groups: &[Vec<usize>],
@@ -461,6 +594,7 @@ fn render_band(
                     v2,
                     view,
                     clip,
+                    item.clip_rect,
                 );
             }
         }
@@ -496,6 +630,7 @@ fn render_band(
                 &masks,
                 &item.mask_groups,
                 clip,
+                item.clip_rect,
                 item.blend_mode,
                 item.wipe,
             );
@@ -530,10 +665,11 @@ fn rasterize_triangle_band(
     v0: &PlanVertex,
     v1: &PlanVertex,
     v2: &PlanVertex,
-    view: ViewTransform,
+    view: PreparedView,
     masks: &[Option<Vec<f32>>],
     mask_groups: &[usize],
     clip: Option<[f32; 4]>,
+    model_clip: Option<[f32; 4]>,
     blend_mode: u32,
     wipe: [f32; 3],
 ) -> usize {
@@ -613,6 +749,26 @@ fn rasterize_triangle_band(
                 row_a += da_dx;
                 continue;
             }
+            if let Some(model_clip) = model_clip {
+                // The screen-space AABB above only bounds the work. The
+                // authoritative clip is the model-space rectangle, exactly as
+                // the GPU fragment stage tests `model_position`.
+                let mx = v0.position[0] * ww0 + v1.position[0] * ww1 + v2.position[0] * ww2;
+                let my = v0.position[1] * ww0 + v1.position[1] * ww1 + v2.position[1] * ww2;
+                if mx < model_clip[0]
+                    || my < model_clip[1]
+                    || mx > model_clip[2]
+                    || my > model_clip[3]
+                {
+                    row_u += du_dx;
+                    row_v += dv_dx;
+                    row_r += dr_dx;
+                    row_g += dg_dx;
+                    row_b += db_dx;
+                    row_a += da_dx;
+                    continue;
+                }
+            }
             let local = (y - band_y0 as i64) as usize * width as usize + x as usize;
             let mut alpha_scale = 1.0f32;
             for group in mask_groups {
@@ -689,8 +845,9 @@ fn rasterize_coverage_band(
     v0: &PlanVertex,
     v1: &PlanVertex,
     v2: &PlanVertex,
-    view: ViewTransform,
+    view: PreparedView,
     clip: Option<[f32; 4]>,
+    model_clip: Option<[f32; 4]>,
 ) {
     let p0 = view.apply(v0.position);
     let p1 = view.apply(v1.position);
@@ -755,6 +912,20 @@ fn rasterize_coverage_band(
                 row_v += dv_dx;
                 row_a += da_dx;
                 continue;
+            }
+            if let Some(model_clip) = model_clip {
+                let mx = v0.position[0] * ww0 + v1.position[0] * ww1 + v2.position[0] * ww2;
+                let my = v0.position[1] * ww0 + v1.position[1] * ww1 + v2.position[1] * ww2;
+                if mx < model_clip[0]
+                    || my < model_clip[1]
+                    || mx > model_clip[2]
+                    || my > model_clip[3]
+                {
+                    row_u += du_dx;
+                    row_v += dv_dx;
+                    row_a += da_dx;
+                    continue;
+                }
             }
             let texel = sample_bilinear_alpha(texture, [row_u, row_v]);
             let value = (row_a * texel).clamp(0.0, 1.0);
