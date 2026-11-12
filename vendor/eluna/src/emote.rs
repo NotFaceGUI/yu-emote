@@ -734,20 +734,26 @@ pub struct EmoteStepFrameOutput {
 }
 
 impl EmoteStaticSprite {
+    // `center_x/center_y` are **not** the icon center: `build_sprite` stores
+    // `ox - icon.origin`, i.e. the icon's top-left in layer space. The
+    // pre-eluna plan (`a020912:src/plan.rs`) builds icon corners as
+    // `-origin .. width-origin`, so the top-left is exactly `center_x`; adding
+    // half-width here shifted every part by `(-w/2, -h/2)` and tore the model
+    // apart (arm across the face, floating eye — 2026-11-11 official sample).
     pub fn left(&self) -> f32 {
-        self.center_x - self.width * 0.5
+        self.center_x
     }
 
     pub fn top(&self) -> f32 {
-        self.center_y - self.height * 0.5
+        self.center_y
     }
 
     pub fn right(&self) -> f32 {
-        self.center_x + self.width * 0.5
+        self.center_x + self.width
     }
 
     pub fn bottom(&self) -> f32 {
-        self.center_y + self.height * 0.5
+        self.center_y + self.height
     }
 
     pub fn bounds_rect(&self) -> (f32, f32, f32, f32) {
@@ -1475,6 +1481,14 @@ fn resolve_composite_mask_owners(
                     // type-0 layer this is set only when the ordinary drawable
                     // was active and had geometry (LayerInfo+132). A visible
                     // emitted sprite is the portable equivalent.
+                    //
+                    // Layer paint opacity must NOT gate this. A stencil-only
+                    // source is authored with `opa: 0` precisely so it never
+                    // paints color while still supplying coverage. In the
+                    // official sample the eye owner lists
+                    // `["shirome", "add_mask"]` and `add_mask` carries
+                    // `opa: 0` on every frame; requiring opacity > 0 dropped it,
+                    // so the closed eye kept an uncovered pupil.
                     if sprite_by_key
                         .get(&source.draw_frame_info.native_draw_key)
                         .is_some_and(|sprite| sprite.visible && sprite.opacity > 0.0)
@@ -1605,8 +1619,23 @@ fn collect_textures(
         let Some(texture) = value.field("texture") else {
             continue;
         };
+        // `texture.pixel` is an object that names the embedded resource, e.g.
+        // `"pixel": {"resource": 1}`; only older/flat layouts carry the index
+        // directly. Reading it with `field_u32("pixel")` fails on the object
+        // form and falls through, which silently gave every page the same
+        // resource index. The official sample then sampled `tex#1` (512x256,
+        // resource 0) with `tex#0`'s 2048x2048 UVs, picking up unrelated atlas
+        // pixels: the closed right eyelid drew a black block over the eye.
         let resource_index = texture
-            .field_u32("pixel")
+            .field("pixel")
+            .and_then(|pixel| {
+                pixel.as_u32().or_else(|| {
+                    pixel
+                        .field_u32("resource")
+                        .or_else(|| pixel.field_u32("index"))
+                        .or_else(|| pixel.field_u32("data"))
+                })
+            })
             .or_else(|| texture.field_u32("data"))
             .or_else(|| texture.field_u32("resource"))
             .ok_or_else(|| EmoteSchemaError::InvalidTextureResource {
@@ -2973,8 +3002,8 @@ fn build_sprite(
     label: Option<String>,
     motion_name: &str,
     base: [f32; 3],
-    ox: f32,
-    oy: f32,
+    _ox: f32,
+    _oy: f32,
     scale_x: f32,
     scale_y: f32,
     rotation_degrees: f32,
@@ -2990,21 +3019,17 @@ fn build_sprite(
     let width = icon.resolved_width();
     let height = icon.resolved_height();
 
-    // FreeMote's win-path static painter applies this subtraction only for
-    // MeshTransform.None. Keep that static behavior here. Dynamic traversal
-    // evaluates recovered mesh deformation and child-mesh-sync semantics; this
-    // static preview path does not re-evaluate parameterized mesh state.
-    let subtract_icon_origin = ctx.mesh_transform == 0;
-    let center_x = if subtract_icon_origin {
-        ox - icon.origin_x
-    } else {
-        ox
-    };
-    let center_y = if subtract_icon_origin {
-        oy - icon.origin_y
-    } else {
-        oy
-    };
+    // The native sprite quad is always built in icon space:
+    // `vertex = (u * width, v * height) - icon.origin`, then transformed by the
+    // layer matrix. `meshTransform` only decides whether `mesh.bp` warps that
+    // quad; it does not move the icon pivot. Gating the origin subtraction on
+    // `meshTransform == 0` shifted every deformed part by (+originX,
+    // +originY): the official sample's eyelids/eyelashes and eyebrows
+    // (`meshTransform: 1`, icon origin 96,84 / 100,64) detached from the face
+    // while non-deformed pupils stayed put. `ox`/`oy` are frame offsets
+    // consumed by type-7 bounds and the mesh chain, not by the sprite pivot.
+    let center_x = -icon.origin_x;
+    let center_y = -icon.origin_y;
 
     Some(EmoteStaticSprite {
         label: label.clone(),
@@ -3715,12 +3740,27 @@ fn evaluate_frame_list(
     // checks through frame+16; retain the prior channels but publish the new
     // cursor/type metadata.
     if current_type == 0 {
-        let mut held = previous_state.cloned().unwrap_or(state);
+        // A serialized type-0 frame is the "this layer draws nothing here" key.
+        // Transforms are carried over from the previous tick so a layer that
+        // reappears later keeps its placement, but the drawable payload is
+        // cleared, so no sprite is emitted.
+        //
+        // Evidence: the official sample's `face_eye_open = 10` maps to local
+        // time 20, where `face_parts/目L` has
+        //     mabuta  t=20 icon 56   (a keyframe with content)
+        //     shirome t=20 type-0, no content
+        //     瞳L     t=20 type-0, no content
+        // and the official engine renders only the lash line — no sclera, no
+        // pupil. Carrying the previous keyframe's content instead (the previous
+        // behaviour) kept the pupil visible under the closed lid.
+        let mut held = previous_state.cloned().unwrap_or_default();
         held.frame_index = Some(current_index);
         held.next_frame_index = frame_list.get(current_index + 1).map(|_| current_index + 1);
         held.frame_start_ticks = current_time;
         held.serialized_frame_type = 0;
         held.interpolation_t = 0.0;
+        held.src = None;
+        held.icon = None;
         return held;
     }
 
@@ -4491,7 +4531,16 @@ fn layer_parameter_eval(
     _frame_list: &[PsbValue],
     fallback_time_ticks: f32,
 ) -> Option<LayerParameterEval> {
-    if let Some(parameterize) = layer.field("parameterize") {
+    // A serialized `parameterize: null` is "no parameter", not "parameter 0".
+    // Every layer of the official sample carries the key, so treating the null
+    // as a present parameter made `resolve_parameterize` fail and pinned the
+    // layer to local time 0. That is what kept `face_parts/目L/…/mabuta`
+    // (eyelid) on the first keyframe while the blink controller moved
+    // `face_eye_open`: the sampled clock never advanced.
+    if let Some(parameterize) = layer
+        .field("parameterize")
+        .filter(|value| !matches!(value, PsbValue::Null))
+    {
         let Some(parameter) = resolve_parameterize(parameterize, parameter_table) else {
             return Some(LayerParameterEval {
                 id: None,
@@ -4592,7 +4641,9 @@ fn resolve_parameterize<'a>(
 }
 
 fn layer_parameter_id(layer: &PsbValue, parameter_table: Option<&[PsbValue]>) -> Option<String> {
-    let parameterize = layer.field("parameterize")?;
+    let parameterize = layer
+        .field("parameterize")
+        .filter(|value| !matches!(value, PsbValue::Null))?;
     let parameter = resolve_parameterize(parameterize, parameter_table)?;
     parameter
         .field_str("id")
@@ -4600,6 +4651,66 @@ fn layer_parameter_id(layer: &PsbValue, parameter_table: Option<&[PsbValue]>) ->
         .or_else(|| parameter.field_str("name"))
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Motion-level `parameterize`: the motion's own clock comes from a variable.
+///
+/// `EPParameter::SetValue` (`sub_10350230`) turns the variable value into a
+/// sampled time: truncate when `discretization` is set, clamp into
+/// `[min(begin,end), max(begin,end)]`, then map with
+/// `(sample - begin) * division / (end - begin)`. `MMotionPlayer` uses that as
+/// the motion's effective time instead of the parent-motion elapsed time.
+///
+/// The distinction matters for nested motions that are pure parameter
+/// responders: `face_parts/目L` and `face_parts/目R` in the official sample
+/// declare `parameterize: 0` (`face_eye_open`, range −10..50, division 60) and
+/// their layers only ever sample the resulting clock. Ignoring the motion-level
+/// `parameterize` left every child layer on the parent clock, which is why
+/// `face_eye_open` animated (0 → 10 → 0) without moving any eyelid mesh.
+///
+/// Returns `None` when the motion is not parameter-driven, so ordinary motions
+/// keep using [`effective_motion_time`].
+fn motion_parameter_time(
+    motion: &PsbValue,
+    parameter_table: Option<&[PsbValue]>,
+    variables: &BTreeMap<String, f32>,
+) -> Option<f32> {
+    let parameterize = motion
+        .field("parameterize")
+        .filter(|value| !matches!(value, PsbValue::Null))?;
+    let parameter = resolve_parameterize(parameterize, parameter_table)?;
+    if !content_bool_like(parameter, "enabled").unwrap_or(true) {
+        return None;
+    }
+    let id = parameter
+        .field_str("id")
+        .or_else(|| parameter.field_str("key"))
+        .or_else(|| parameter.field_str("name"))
+        .filter(|s| !s.is_empty())?;
+    let value = *variables.get(id)?;
+    let begin = parameter
+        .field_f32("rangeBegin")
+        .or_else(|| parameter.field_f32("min"))
+        .unwrap_or(0.0);
+    let end = parameter
+        .field_f32("rangeEnd")
+        .or_else(|| parameter.field_f32("max"))
+        .unwrap_or(1.0);
+    let division = parameter.field_f32("division").unwrap_or(1.0);
+    if !division.is_finite()
+        || division <= 0.0
+        || !begin.is_finite()
+        || !end.is_finite()
+        || (end - begin).abs() <= f32::EPSILON
+    {
+        return Some(value);
+    }
+    let mut sample = value;
+    if content_bool_like(parameter, "discretization").unwrap_or(false) {
+        sample = sample.trunc();
+    }
+    let sample = sample.min(begin.max(end)).max(begin.min(end));
+    Some((sample - begin) * division / (end - begin))
 }
 
 
@@ -4777,8 +4888,31 @@ fn travel_layer_at(
     let mut draw_ctx = ctx.clone();
     let mut child_ctx = ctx.clone();
     let sync_child_shape = (ctx.mesh_sync_child & 0x8) != 0;
-    let layer_mesh_parameter = if sync_child_shape {
-        layer_parameter_id(&layer, parameter_table)
+    // Which variables does the patch this layer hands to its children depend on?
+    // A layer with `meshSyncChildMask & 8` warps descendants through its own
+    // frameList `mesh.bp`, and that bp is chosen by the layer's
+    // parameterization. Most deformers (`eye_pos`, `hi_pos`, `act_sp`) carry no
+    // `parameterize` of their own: the enclosing motion's `parameter` list is
+    // what names the driving variables. Falling back to that list keeps the
+    // dependency set non-empty, which is what lets the patch survive the
+    // nested-player boundary in `apply_motion_layer_inherit`.
+    let layer_mesh_parameter: Option<BTreeSet<String>> = if sync_child_shape {
+        match layer_parameter_id(&layer, parameter_table) {
+            Some(id) => Some(BTreeSet::from([id])),
+            None => parameter_table.map(|parameters| {
+                parameters
+                    .iter()
+                    .filter_map(|parameter| {
+                        parameter
+                            .field_str("id")
+                            .or_else(|| parameter.field_str("key"))
+                            .or_else(|| parameter.field_str("name"))
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                    })
+                    .collect::<BTreeSet<String>>()
+            }),
+        }
     } else {
         None
     };
@@ -4797,16 +4931,16 @@ fn travel_layer_at(
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), patch);
             if sync_child_shape {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
-                if let Some(id) = &layer_mesh_parameter {
-                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
+                if let Some(ids) = &layer_mesh_parameter {
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).extend(ids.iter().cloned());
                 }
             }
         }
         if sync_child_shape {
             if let Some(patch) = mesh_combinator.child_patch {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), patch);
-                if let Some(id) = &layer_mesh_parameter {
-                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
+                if let Some(ids) = &layer_mesh_parameter {
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).extend(ids.iter().cloned());
                 }
             }
         }
@@ -4881,8 +5015,8 @@ fn travel_layer_at(
             draw_ctx.mesh_patch = combine_patch(draw_ctx.mesh_patch.take(), mesh);
             if sync_child_shape {
                 child_ctx.mesh_patch = combine_patch(child_ctx.mesh_patch.take(), mesh);
-                if let Some(id) = &layer_mesh_parameter {
-                    Arc::make_mut(&mut child_ctx.mesh_parameters).insert(id.clone());
+                if let Some(ids) = &layer_mesh_parameter {
+                    Arc::make_mut(&mut child_ctx.mesh_parameters).extend(ids.iter().cloned());
                 }
             }
         }
@@ -4957,9 +5091,12 @@ fn travel_layer_at(
 
 
         if let Some(src) = state.src.as_deref().filter(|src| !src.is_empty()) {
-            let visible = draw_ctx.ready_to_draw
-                && draw_ctx.base_visible
-                && draw_ctx.opacity_multiplier > 0.0;
+            // `visible` gates geometry, not paint. A stencil-only source keeps
+            // `opa: 0` and must still contribute coverage (`add_mask` in the
+            // official sample), so a zero layer opacity may not hide the
+            // drawable. Whether an item paints is decided later from
+            // `DrawItem::paints_color`.
+            let visible = draw_ctx.ready_to_draw && draw_ctx.base_visible;
             let visible_child_ctx = ctx_with_visible(child_ctx.clone(), visible);
             if native_nested_motion_layer_type(draw_ctx.layer_type) {
                 if let Some(rest) = src.strip_prefix("motion/") {
@@ -5280,11 +5417,28 @@ fn apply_motion_layer_inherit(
         ctx.mesh_parameters = Arc::default();
         return;
     };
+    // An ancestor's inherited patch stays valid as long as the child motion
+    // still parameterizes one of the variables that patch depends on. The
+    // previous rule required four shared parameters, which is never satisfied
+    // by small face motions: `face_parts/瞳L` authors exactly three
+    // (`face_eye_UD`, `face_eye_LR`, `face_eye_open`), so the eyelid mesh synced
+    // from `eye_pos` (`meshSyncChildMask: 8`) was discarded on every rebuild and
+    // the pupil never deformed — the eye kept a full open-eye pupil at every
+    // blink value while the official engine squashes it.
+    if std::env::var_os("ELUNA_TRACE_MESH_SYNC").is_some() {
+        eprintln!(
+            "[eluna]   gate {}/{} targets={:?} have={:?}",
+            object_name,
+            motion_name,
+            target_parameters.iter().collect::<Vec<_>>(),
+            ctx.mesh_parameters.iter().collect::<Vec<_>>()
+        );
+    }
     let shared_parameter_count = target_parameters
         .iter()
         .filter(|parameter| ctx.mesh_parameters.contains(*parameter))
         .count();
-    if shared_parameter_count < 4 {
+    if shared_parameter_count == 0 {
         ctx.mesh_patch = None;
         ctx.mesh_parameters = Arc::default();
     }
@@ -6789,6 +6943,8 @@ fn resolve_pending_nested_motions(
             previous_positions,
             target_position,
         );
+        let had_patch = motion_ctx.mesh_patch.is_some();
+        let nparams = motion_ctx.mesh_parameters.len();
         apply_motion_layer_inherit(
             &pending.layer,
             object_table,
@@ -6796,6 +6952,16 @@ fn resolve_pending_nested_motions(
             &pending.motion_name,
             &mut motion_ctx,
         );
+        if std::env::var_os("ELUNA_TRACE_MESH_SYNC").is_some() {
+            eprintln!(
+                "[eluna] nested {}/{} had_patch={} nparams={} -> patch={}",
+                pending.object_name,
+                pending.motion_name,
+                had_patch,
+                nparams,
+                motion_ctx.mesh_patch.is_some()
+            );
+        }
         recurse_motion_at(
             object_table,
             &pending.object_name,
@@ -6890,7 +7056,17 @@ fn recurse_motion_at(
         .field("parameter")
         .and_then(PsbValue::as_list)
         .or(parameter_table);
-    let effective_time = effective_motion_time(motion, time_ticks);
+    // A motion that names a `parameterize` entry is a parameter-driven motion:
+    // its own clock comes from the variable's value, not from the parent
+    // motion's elapsed time. `efb_build_static_scene`-style traversal used to
+    // ignore this, so `face_parts/目L` (parameterize 0 -> `face_eye_open`)
+    // stayed pinned to the parent clock and the blink controller moved the
+    // variable without moving any eyelid mesh. See
+    // [`motion_parameter_time`] for the native evidence.
+    let effective_time = match motion_parameter_time(motion, motion_parameter_table, variables) {
+        Some(time) => time,
+        None => effective_motion_time(motion, time_ticks),
+    };
     let priority_ranks = Arc::new(motion_priority_ranks(motion, effective_time));
     let scope_start = layer_states.len();
     let sprite_scope_start = out.len();
@@ -8363,3 +8539,4 @@ mod tests {
         assert_eq!(b.max_y, 50.0);
     }
 }
+

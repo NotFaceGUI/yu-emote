@@ -303,6 +303,11 @@ impl EmoteRuntime {
     pub fn from_bytes(data: &[u8], options: EmoteLoadOptions) -> Result<Self, EmoteRuntimeError> {
         let (normalized_data, psb) = PsbFile::parse_normalized(data, &options.normalize)?;
         let schema = EmoteModelSchema::from_psb(&psb)?;
+        // Official `IEmoteDevice::CreatePlayer` evaluates the authored default
+        // motion at time 0 (the official `emote_test.psb` screenshot matches
+        // this pose). The static-scene path (`build_static_scene`) has a
+        // different per-part transform for this PSB and tears the model apart,
+        // so keep the default-motion fallback.
         let active_motion = options
             .motion
             .clone()
