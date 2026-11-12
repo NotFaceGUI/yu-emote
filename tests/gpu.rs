@@ -115,11 +115,21 @@ fn gpu_matches_cpu_and_applies_inner_mask() {
             data[index + 3],
         ]
     };
-    // Inside the mask: red. Outside: transparent.
-    assert_eq!(pixel(&rgba, 1, 1), [255, 0, 0, 255]);
-    assert_eq!(pixel(&rgba, 3, 3), [0, 0, 0, 0]);
-    assert_eq!(pixel(&cpu.rgba8, 1, 1), [255, 0, 0, 255]);
-    assert_eq!(pixel(&cpu.rgba8, 3, 3), [0, 0, 0, 0]);
+    // Inside the mask: red. Outside: transparent. The projection reflects X
+    // (see `soft::PROJECTION_MIRROR_X`): model column `x` lands on screen
+    // column `width - 1 - x`, so the mask over model (0,0)-(2,2) covers screen
+    // columns 6..8 while the unmasked quad covers 4..8.
+    let screen_x = |x: usize| {
+        if soft::PROJECTION_MIRROR_X {
+            8 - 1 - x
+        } else {
+            x
+        }
+    };
+    assert_eq!(pixel(&rgba, screen_x(1), 1), [255, 0, 0, 255]);
+    assert_eq!(pixel(&rgba, screen_x(3), 3), [0, 0, 0, 0]);
+    assert_eq!(pixel(&cpu.rgba8, screen_x(1), 1), [255, 0, 0, 255]);
+    assert_eq!(pixel(&cpu.rgba8, screen_x(3), 3), [0, 0, 0, 0]);
 
     // Interior pixels should agree exactly; edges may differ by filtering.
     let mut diff = 0u64;

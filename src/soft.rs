@@ -133,6 +133,12 @@ pub struct SoftStats {
     pub feedback: usize,
 }
 
+/// D3D9 `D3DRS_ALPHAREF` used by the official driver (`FUN_10057a90`).
+///
+/// Together with `D3DRS_ALPHAFUNC = D3DCMP_GREATER` this drops fragments whose
+/// alpha is at or below the reference instead of blending them.
+pub const ALPHA_TEST_REF: u8 = 0x40;
+
 /// Presentation transform applied to plan vertices before rasterization.
 ///
 /// This is the same affine shape as the official player transform:
@@ -263,16 +269,27 @@ struct PreparedView {
     sin: f32,
     cos: f32,
     offset: [f32; 2],
+    /// X coordinate of the projection mirror axis, in output pixels.
+    ///
+    /// The official driver negates the world X axis in the projection stage, so
+    /// the model is reflected about the camera axis, which the host centers on
+    /// the canvas. See [`PROJECTION_MIRROR_X`] for the evidence.
+    mirror_x: f32,
 }
 
-impl From<ViewTransform> for PreparedView {
-    fn from(view: ViewTransform) -> Self {
+impl PreparedView {
+    fn new(view: ViewTransform, canvas_width: u32) -> Self {
         let (sin, cos) = view.rotation.sin_cos();
         Self {
             scale: view.scale,
             sin,
             cos,
             offset: view.offset,
+            mirror_x: if PROJECTION_MIRROR_X {
+                canvas_width.max(1) as f32
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -282,12 +299,44 @@ impl PreparedView {
     fn apply(self, point: [f32; 2]) -> [f32; 2] {
         let x = point[0] * self.scale;
         let y = point[1] * self.scale;
+        let screen_x = x * self.cos - y * self.sin + self.offset[0];
         [
-            x * self.cos - y * self.sin + self.offset[0],
+            if PROJECTION_MIRROR_X {
+                self.mirror_x - screen_x
+            } else {
+                screen_x
+            },
             x * self.sin + y * self.cos + self.offset[1],
         ]
     }
 }
+
+/// Official D3D9 projection reflects world X onto screen −X.
+///
+/// Evidence (`emotedriver.dll` sha256 `44d104279ef06766ecb118b9107c0cf683d785dcf825d5aaa31908ca7e1f8ea2`,
+/// the only `D3DXMatrixLookAtLH` call site `FUN_100582c0`):
+///
+/// ```text
+/// 0x10058508  CALL dword ptr [0x1006f110]   ; d3dx9_43!D3DXMatrixLookAtLH
+/// 0x1005850e  FLD  float ptr [ESP+0x138]    ; view matrix m11
+/// 0x10058522  FCHS                          ; negate it
+/// 0x10058525  FSTP float ptr [ESP+0x13c]    ; store back as m11
+/// 0x1005853c  CALL d3dx9_43!D3DXMatrixMultiply    ; view * projection
+/// 0x10058560  CALL d3dx9_43!D3DXMatrixTranspose
+/// 0x10058577/0x100588c1  vtable +0x178  (SetVertexShaderConstantF) -> c0..c3
+/// ```
+///
+/// Negating the view matrix's X row is a reflection of view space, which the
+/// orthographic projection maps to `screen_x -> canvas_width - screen_x`. The
+/// same reflection is applied here instead of in [`ViewTransform`] because the
+/// official negation happens once, after the player transform; folding it into
+/// the affine would cancel out under [`ViewTransform::compose`].
+///
+/// Observed consequence on the official sample (`emote_test.psb`): the fringe
+/// parting sits at +23.7% of the head width and the blush left/right mass ratio
+/// is 0.31; without this mirror the same pose gives −22.8% and 1.40, and
+/// mirroring the output reproduces +22.8% / 0.71.
+pub const PROJECTION_MIRROR_X: bool = true;
 
 fn fit_scale(plan: &RenderPlan, margin: f32) -> Option<f32> {
     let (min, max) = plan.bounds()?;
@@ -320,10 +369,11 @@ fn screen_clip(rect: Option<[f32; 4]>, view: PreparedView) -> Option<[f32; 4]> {
 }
 
 fn color_item(item: &DrawItem) -> bool {
-    !matches!(
-        item.pass,
-        crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
-    )
+    item.paints_color
+        && !matches!(
+            item.pass,
+            crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
+        )
 }
 
 /// Render a plan with already decoded textures keyed by PSB resource index.
@@ -338,14 +388,14 @@ pub fn render_with_textures(
 ) -> Result<(RenderImage, SoftStats), EmoteError> {
     let width = plan.width.max(1);
     let height = plan.height.max(1);
-    let view = PreparedView::from(view);
+    let view = PreparedView::new(view, width);
     let mut rgba8 = vec![0u8; width as usize * height as usize * 4];
     let mut stats = collect_stats(plan, textures);
 
     let workers = effective_threads(width, height);
     let ranges = band_ranges(height, workers);
-    let bands = build_band_plans(plan, textures, view, width, height, &ranges);
     let source_groups = build_source_groups(plan);
+    let bands = build_band_plans(plan, textures, view, width, height, &ranges, &source_groups);
     let source_groups: &[Vec<usize>] = &source_groups;
 
     let mut slices: Vec<&mut [u8]> = Vec::with_capacity(ranges.len());
@@ -473,6 +523,7 @@ fn build_band_plans(
     width: u32,
     height: u32,
     ranges: &[(u32, u32)],
+    source_groups: &[Vec<usize>],
 ) -> Vec<BandPlan> {
     let mut bands = vec![BandPlan::default(); ranges.len()];
     for (index, item) in plan.items.iter().enumerate() {
@@ -483,6 +534,14 @@ fn build_band_plans(
             continue;
         };
         let is_color = color_item(item);
+        // A composite-mask source is normally an ordinary color drawable (the
+        // official sample uses the sclera `shirome` layer). It must contribute
+        // coverage even though it is also painted. Previously only non-color
+        // pass items entered `mask`, so a color source produced an all-zero
+        // mask and the masked pupil disappeared entirely.
+        let is_mask_source = source_groups
+            .get(index)
+            .is_some_and(|groups| !groups.is_empty());
         for (band_index, &(y0, y1)) in ranges.iter().enumerate() {
             if max_y < y0 as f32 || min_y >= y1 as f32 {
                 continue;
@@ -494,7 +553,8 @@ fn build_band_plans(
                         bands[band_index].groups.push(group);
                     }
                 }
-            } else {
+            }
+            if !is_color || is_mask_source {
                 bands[band_index].mask.push(index);
             }
         }
@@ -562,7 +622,21 @@ fn render_band(
     let band_height = (y1 - y0) as usize;
     let mut masks: Vec<Option<Vec<f32>>> = vec![None; plan.mask_groups.len()];
     for &group in &band.groups {
-        let mut buffer = vec![0.0f32; width as usize * band_height];
+        // Official stencil semantics, recovered from `emotedriver.dll`
+        // `0x10057fa9`..`0x1005825b` (D3D9 render states):
+        //
+        //   0x52 STENCILENABLE = 1      0x35 STENCILFAIL  = 1 (KEEP)
+        //   0x38 STENCILFUNC   = 3      0x36 STENCILPASS  = 7 (INCR)
+        //       (D3DCMP_EQUAL)           0x37 STENCILZFAIL = 7 (INCR)
+        //   0x39 STENCILREF    = ref    0x3a STENCILMASK  = 0xff
+        //
+        // Each listed source increments the stencil where it covers, and the
+        // consumer draws only where the counter equals the reference (the number
+        // of sources). That makes multiple sources an **intersection** of their
+        // coverages, not a union. The previous MAX blend made them a union, so a
+        // pupil covered by the sclera alone stayed visible once a second source
+        // (`add_mask`) joined the group.
+        let mut accumulated: Option<Vec<f32>> = None;
         for &item_index in &band.mask {
             if !source_groups
                 .get(item_index)
@@ -574,6 +648,7 @@ fn render_band(
             let Some(texture) = item_texture(item, textures) else {
                 continue;
             };
+            let mut contribution = vec![0.0f32; width as usize * band_height];
             let clip = screen_clip(item.clip_rect, view);
             for triangle in item.indices.chunks_exact(3) {
                 let (Some(v0), Some(v1), Some(v2)) = (
@@ -584,7 +659,7 @@ fn render_band(
                     continue;
                 };
                 rasterize_coverage_band(
-                    &mut buffer,
+                    &mut contribution,
                     y0,
                     y1,
                     width,
@@ -597,8 +672,18 @@ fn render_band(
                     item.clip_rect,
                 );
             }
+            accumulated = Some(match accumulated {
+                Some(previous) => previous
+                    .into_iter()
+                    .zip(contribution)
+                    .map(|(a, b)| (a * b).clamp(0.0, 1.0))
+                    .collect(),
+                None => contribution,
+            });
         }
-        masks[group] = Some(buffer);
+        masks[group] = Some(
+            accumulated.unwrap_or_else(|| vec![1.0f32; width as usize * band_height]),
+        );
     }
 
     let mut covered = 0usize;
@@ -770,18 +855,29 @@ fn rasterize_triangle_band(
                 }
             }
             let local = (y - band_y0 as i64) as usize * width as usize + x as usize;
+            // Official stencil is a hard test: `STENCILFUNC=D3DCMP_EQUAL` against
+            // a reference equal to the source count, with `INCR` per source, so a
+            // fragment passes only when the counter matches exactly. Applying the
+            // accumulated coverage as a soft multiplier instead let the pupil
+            // bleed through the anti-aliased gradient at the sclera's lower edge
+            // (the small dark bumps just under the lash line). Threshold the
+            // product the same way the hardware compares the counter.
             let mut alpha_scale = 1.0f32;
+            let mut stencil_pass = true;
             for group in mask_groups {
                 let Some(Some(mask)) = masks.get(*group) else {
-                    alpha_scale = 0.0;
+                    stencil_pass = false;
                     break;
                 };
                 let coverage = mask[local];
-                if coverage <= 0.003 {
-                    alpha_scale = 0.0;
+                if coverage < 0.5 {
+                    stencil_pass = false;
                     break;
                 }
                 alpha_scale *= coverage;
+            }
+            if !stencil_pass {
+                alpha_scale = 0.0;
             }
             if alpha_scale <= 0.0 {
                 row_u += du_dx;
@@ -796,6 +892,22 @@ fn rasterize_triangle_band(
             let mut alpha = row_a * alpha_scale;
             if wipe[0] > 0.5 {
                 alpha = (alpha * wipe[1] + wipe[2]).clamp(0.0, 1.0);
+            }
+            // Official alpha test: `FUN_10057a90` sets D3DRS_ALPHATESTENABLE=1,
+            // D3DRS_ALPHAREF=0x40 and D3DRS_ALPHAFUNC=D3DCMP_GREATER, so a
+            // fragment with alpha <= 64/255 is dropped instead of being blended.
+            // Without it the anti-aliased edges of the eyelid and eye-shadow
+            // sheets accumulate as a grey band that the official engine never
+            // shows.
+            let combined_alpha = texel[3] * alpha;
+            if combined_alpha * 255.0 <= f32::from(crate::soft::ALPHA_TEST_REF) {
+                row_u += du_dx;
+                row_v += dv_dx;
+                row_r += dr_dx;
+                row_g += dg_dx;
+                row_b += db_dx;
+                row_a += da_dx;
+                continue;
             }
             let mut src = [
                 texel[0] * row_r,
@@ -890,7 +1002,12 @@ fn rasterize_coverage_band(
     let x_start = min_x as f32 + 0.5;
     let du_dx = v0.uv[0] * a0 + v1.uv[0] * a1 + v2.uv[0] * a2;
     let dv_dx = v0.uv[1] * a0 + v1.uv[1] * a1 + v2.uv[1] * a2;
-    let da_dx = v0.color[3] * a0 + v1.color[3] * a1 + v2.color[3] * a2;
+    // The coverage weight is the plain barycentric sum (see `row_a`), so its
+    // per-pixel increment is the derivative of that sum — not of the
+    // opacity-scaled vertex alpha. Using the alpha gradient made the running
+    // value drift away from the geometry weight and produced CPU/GPU
+    // disagreement along partially covered mask edges.
+    let da_dx = a0 + a1 + a2;
 
     for y in min_y..=max_y {
         let yf = y as f32 + 0.5;
@@ -899,7 +1016,11 @@ fn rasterize_coverage_band(
         let mut row_w2 = a2 * x_start + b2 * yf + c2;
         let mut row_u = v0.uv[0] * row_w0 + v1.uv[0] * row_w1 + v2.uv[0] * row_w2;
         let mut row_v = v0.uv[1] * row_w0 + v1.uv[1] * row_w1 + v2.uv[1] * row_w2;
-        let mut row_a = v0.color[3] * row_w0 + v1.color[3] * row_w1 + v2.color[3] * row_w2;
+        // Stencil coverage is authored independently of the layer's paint
+        // opacity: the official sample's mask-only `add_mask` keeps `opa: 0` and
+        // still supplies the closed-eye shape. Use the geometry weight only,
+        // never the opacity-scaled vertex alpha.
+        let mut row_a = row_w0 + row_w1 + row_w2;
         for x in min_x..=max_x {
             let ww0 = row_w0;
             let ww1 = row_w1;
@@ -927,7 +1048,12 @@ fn rasterize_coverage_band(
                     continue;
                 }
             }
-            let texel = sample_bilinear_alpha(texture, [row_u, row_v]);
+            // Native stencil coverage comes from the source texture itself, not
+            // from one fixed channel: the official sample's `add_mask` encodes
+            // its shape in the blue channel, while sclera pages encode it in
+            // alpha. Taking the per-texel maximum keeps both forms working
+            // without special-casing a layer name.
+            let texel = sample_bilinear_mask(texture, [row_u, row_v]);
             let value = (row_a * texel).clamp(0.0, 1.0);
             let local = (y - band_y0 as i64) as usize * width as usize + x as usize;
             if value > target[local] {
@@ -979,6 +1105,38 @@ fn sample_bilinear(texture: &DecodedTexture, uv: [f32; 2]) -> [f32; 4] {
 }
 
 #[inline]
+/// Bilinear stencil coverage: the maximum of the four channels per tap.
+///
+/// A stencil source may carry its shape in alpha or in a color channel, so the
+/// coverage of one texel is `max(r, g, b, a)`. Sampling per channel keeps the
+/// interpolation identical to [`sample_bilinear_alpha`].
+fn sample_bilinear_mask(texture: &DecodedTexture, uv: [f32; 2]) -> f32 {
+    let width = texture.width as i64;
+    let height = texture.height as i64;
+    let x = uv[0] * width as f32 - 0.5;
+    let y = uv[1] * height as f32 - 0.5;
+    let x0 = x.floor();
+    let y0 = y.floor();
+    let fx = x - x0;
+    let fy = y - y0;
+    let xi = x0 as i64;
+    let yi = y0 as i64;
+    let x0c = xi.clamp(0, width - 1) as usize;
+    let x1c = (xi + 1).clamp(0, width - 1) as usize;
+    let y0c = yi.clamp(0, height - 1) as usize;
+    let y1c = (yi + 1).clamp(0, height - 1) as usize;
+    let pitch = width as usize * 4;
+    let texel = |row: usize, col: usize| -> f32 {
+        let base = row * pitch + col * 4;
+        let px = &texture.rgba8[base..base + 4];
+        let m = px[0].max(px[1]).max(px[2]).max(px[3]);
+        m as f32 * (1.0 / 255.0)
+    };
+    let top = texel(y0c, x0c) + (texel(y0c, x1c) - texel(y0c, x0c)) * fx;
+    let bottom = texel(y1c, x0c) + (texel(y1c, x1c) - texel(y1c, x0c)) * fx;
+    top + (bottom - top) * fy
+}
+
 fn sample_bilinear_alpha(texture: &DecodedTexture, uv: [f32; 2]) -> f32 {
     let width = texture.width as i64;
     let height = texture.height as i64;

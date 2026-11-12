@@ -39,8 +39,17 @@ fn vs_main(input: VsIn) -> VsOut {
         scaled.x * view.rotation.x - scaled.y * view.rotation.y,
         scaled.x * view.rotation.y + scaled.y * view.rotation.x,
     ) + view.offset;
+    // Official projection reflection: `emotedriver.dll` negates the X row of
+    // the view matrix immediately after `D3DXMatrixLookAtLH`
+    // (`0x1005850e` FLD m11 -> `0x10058522` FCHS -> `0x10058525` store), which
+    // maps world X onto screen -X. Under this orthographic screen mapping that
+    // is exactly `screen_x -> view.size.x - screen_x`. See
+    // `soft::PROJECTION_MIRROR_X` for the complete evidence chain. It belongs
+    // in the projection, not in the model transform, because the official
+    // negation happens once after the player transform.
+    let screen_x = view.size.x - screen.x;
     let ndc = vec2<f32>(
-        screen.x / view.size.x * 2.0 - 1.0,
+        screen_x / view.size.x * 2.0 - 1.0,
         1.0 - screen.y / view.size.y * 2.0,
     );
     var out: VsOut;
@@ -91,22 +100,34 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
     c = native_texture_stage(c, input.blend_mode);
     let mask = textureSample(mask_tex, sprite_sampler, input.position.xy / view.size).r;
     c = vec4<f32>(c.rgb, c.a * mask);
-    if (c.a <= 0.003) {
+    // Official alpha test: `FUN_10057a90` sets D3DRS_ALPHATESTENABLE=1,
+    // D3DRS_ALPHAREF=0x40 and D3DRS_ALPHAFUNC=D3DCMP_GREATER, so fragments with
+    // alpha <= 64/255 are dropped rather than blended. Without it the
+    // anti-aliased sheet edges build up a grey band the official engine never
+    // shows.
+    if (c.a * 255.0 <= 64.0) {
         discard;
     }
     return c;
 }
 
-// Mask-generation pass: write texture alpha times vertex alpha. The mask
-// target is Rgba8Unorm with MAX blending, so overlapping sources union.
+// Mask-generation pass. Coverage comes from the source texture itself and is
+// deliberately independent of the layer's paint opacity: the official sample's
+// mask-only `add_mask` keeps `opa: 0` on every frame and still supplies the
+// closed-eye shape, so multiplying by `input.color.a` would zero it.
+// The stencil shape may live in alpha or in a color channel (`add_mask` uses
+// blue), so the per-texel coverage is the maximum of the four channels.
+// The mask target accumulates with a dst *= src blend, which makes multiple
+// sources intersect exactly like the official `EQUAL ref` stencil test.
 @fragment
 fn fs_mask(input: VsOut) -> @location(0) vec4<f32> {
     if (clipped(input)) {
         discard;
     }
-    var c = textureSample(sprite_tex, sprite_sampler, input.texcoord) * input.color;
+    let c = textureSample(sprite_tex, sprite_sampler, input.texcoord);
+    var coverage = max(max(c.r, c.g), max(c.b, c.a));
     if (input.wipe.z > 0.5) {
-        c = vec4<f32>(c.rgb, clamp(c.a * input.wipe.x + input.wipe.y, 0.0, 1.0));
+        coverage = clamp(coverage * input.wipe.x + input.wipe.y, 0.0, 1.0);
     }
-    return vec4<f32>(c.a, 0.0, 0.0, 1.0);
+    return vec4<f32>(coverage, 0.0, 0.0, 1.0);
 }

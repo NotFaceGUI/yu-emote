@@ -66,6 +66,12 @@ pub struct DrawItem {
     pub mask_groups: Vec<usize>,
     /// Type-12 wipe parameters (`enabled`, `scale`, `bias`).
     pub wipe: [f32; 3],
+    /// Whether this item contributes color to the frame.
+    ///
+    /// Stencil-only sources keep their geometry so the mask can be built, but
+    /// paint nothing: the official sample's `add_mask` carries `opa: 0` on
+    /// every frame and exists purely to feed the eye stencil.
+    pub paints_color: bool,
     /// Vertices.
     pub vertices: Vec<PlanVertex>,
     /// Triangle indices.
@@ -115,16 +121,20 @@ impl RenderPlan {
     /// `canvas` is the output size used by [`crate::soft::ViewTransform::fit`].
     pub fn from_scene(scene: &EmoteStaticScene, canvas: [u32; 2]) -> Self {
         let mut skipped: BTreeMap<String, usize> = BTreeMap::new();
+        // A sprite with layer opacity 0 paints nothing, but it is still a valid
+        // stencil coverage source: the official sample's `add_mask` layer keeps
+        // `opa` at 0 on every frame and only exists to contribute its blue
+        // channel to the eye stencil (`stencilCompositeMaskLayerList` =
+        // `["shirome", "add_mask"]`). Dropping zero-opacity sprites before mask
+        // resolution removed that source, so the closed eye kept the sclera's
+        // full open-eye coverage. Keep them in the plan and suppress their color
+        // contribution later instead.
         let visible: Vec<&EmoteStaticSprite> = scene
             .sprites
             .iter()
             .filter(|sprite| {
                 if !sprite.visible {
                     *skipped.entry("invisible".to_owned()).or_default() += 1;
-                    return false;
-                }
-                if sprite.opacity <= 0.0 {
-                    *skipped.entry("zero-opacity".to_owned()).or_default() += 1;
                     return false;
                 }
                 if sprite.width <= 0.0 || sprite.height <= 0.0 {
@@ -171,6 +181,16 @@ impl RenderPlan {
                 let Some(info) = layer_infos.get(key).copied() else {
                     break;
                 };
+                // D3D9 stencil state is per MMotionPlayer: `瞳L` is a type-3
+                // nested player and the official driver clears/resets the
+                // stencil when a nested player starts drawing. Propagating the
+                // owner's coverage across that boundary clipped the pupil and
+                // highlight (both live in `瞳L`) to the sclera shape, which the
+                // official engine never does — its half-closed eye keeps a full
+                // pupil and its highlight.
+                if info.layer_type == 3 {
+                    break;
+                }
                 if info.stencil_phase == 1 {
                     let group = *group_by_owner.entry(key.clone()).or_insert_with(|| {
                         let source_keys: Vec<Vec<u64>> = if (info.stencil_type & 4) != 0 {
@@ -193,12 +213,115 @@ impl RenderPlan {
                         mask_groups.len() - 1
                     });
                     if !items[index].mask_groups.contains(&group) {
-                        items[index].mask_groups.push(group);
+                        // A mask source is never clipped by its own group.
+                        // `coverage` is accumulated from the source alpha, so a
+                        // self-referencing source gates itself on itself and the
+                        // surviving coverage is incomplete rather than the
+                        // authored silhouette. The official sample hit this:
+                        // `face_parts/目L`'s sclera `shirome` is both the type-12
+                        // owner's coverage source and a descendant of that owner,
+                        // which left the pupil only partly clipped at
+                        // `face_eye_open = 10` instead of disappearing under the
+                        // closed lid.
+                        let is_own_source = mask_groups[group].sources.contains(&index);
+                        if !is_own_source {
+                            items[index].mask_groups.push(group);
+                        }
                     }
                 } else if info.stencil_phase == 2 {
                     *skipped.entry("outer-stencil".to_owned()).or_default() += 1;
                 }
                 cursor = info.stencil_parent_native_key.as_ref();
+            }
+        }
+        // Deformation-base composite masks: `composite_mask_owners` maps each
+        // base owner path (`…/頭部変形基礎/stencil`, `…/下半身変形基礎/stencil`,
+        // `…/全身変形基礎/stencil`) to the face/body parts that form its
+        // coverage. The pre-eluna plan used this map; without it the eyelid /
+        // eye-shadow layers draw outside the head silhouette (official sample:
+        // ghost eye on the cheek). `stencil_parent_native_key` is empty for
+        // this PSB, so this map is the authoritative consumer→owner link.
+        for (owner_path, source_paths) in &scene.composite_mask_owners {
+            let Some(owner_index) = scene
+                .layer_states
+                .iter()
+                .position(|state| &state.path == owner_path)
+            else {
+                continue;
+            };
+            let owner_state = &scene.layer_states[owner_index];
+            let owner_key = owner_state.draw_frame_info.native_draw_key.clone();
+            let mut sources: Vec<usize> = source_paths
+                .iter()
+                .filter_map(|path| {
+                    let state = scene.layer_states.iter().find(|state| &state.path == path)?;
+                    key_to_item
+                        .get(&state.draw_frame_info.native_draw_key)
+                        .copied()
+                })
+                .collect();
+            if sources.is_empty() {
+                // Eye stencils (`…/ステンシル(shirome)`) carry an empty
+                // `stencilCompositeMaskLayerList`; the pre-eluna plan used the
+                // first color layer in the **previous sibling subtree** (the
+                // sclera, `…/mabuta/白目X_le/shirome`) as the mask. Without
+                // it pupils/highlights leak outside the white of the eye.
+                let owner_parent = owner_path
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+                    .unwrap_or("");
+                let previous_sibling = (0..owner_index).rev().find(|&index| {
+                    scene.layer_states[index]
+                        .path
+                        .rsplit_once('/')
+                        .map(|(parent, _)| parent)
+                        == Some(owner_parent)
+                });
+                if let Some(sibling_index) = previous_sibling {
+                    let sibling_path = &scene.layer_states[sibling_index].path;
+                    let prefix = format!("{sibling_path}/");
+                    if let Some(source) = (sibling_index + 1..owner_index).find_map(|index| {
+                        let state = &scene.layer_states[index];
+                        if !state.path.starts_with(&prefix) {
+                            return None;
+                        }
+                        key_to_item
+                            .get(&state.draw_frame_info.native_draw_key)
+                            .copied()
+                    }) {
+                        sources.push(source);
+                    }
+                }
+            }
+            if sources.is_empty() {
+                continue;
+            }
+            let source_items = sources.clone();
+            let group = *group_by_owner.entry(owner_key.clone()).or_insert_with(|| {
+                mask_groups.push(MaskGroup {
+                    sources,
+                    owner: owner_key.clone(),
+                });
+                mask_groups.len() - 1
+            });
+            // The face parts listed as sources are themselves the consumers:
+            // the base owner's coverage is the union of those parts, and each
+            // part must be clipped to that union (eyelid/eye-shadow/hair
+            // fragments otherwise leak outside the head silhouette).
+            for index in source_items {
+                if !items[index].mask_groups.contains(&group)
+                    && !mask_groups[group].sources.contains(&index)
+                {
+                    items[index].mask_groups.push(group);
+                }
+            }
+            for (index, sprite) in visible.iter().enumerate() {
+                if sprite.draw_frame_info.parent_mask_path.as_deref()
+                    == Some(owner_path.as_str())
+                    && !items[index].mask_groups.contains(&group)
+                {
+                    items[index].mask_groups.push(group);
+                }
             }
         }
 
@@ -338,6 +461,7 @@ fn build_item(sprite: &EmoteStaticSprite) -> DrawItem {
             sprite.draw_frame_info.stencil_wipe_scale,
             sprite.draw_frame_info.stencil_wipe_bias,
         ],
+        paints_color: sprite.opacity > 0.0,
         bounds: vertex_bounds(&vertices),
         vertices,
         indices,

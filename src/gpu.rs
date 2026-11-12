@@ -158,6 +158,16 @@ pub struct GpuRenderer {
     texture_layout: wgpu::BindGroupLayout,
     pipelines: [wgpu::RenderPipeline; 6],
     mask_pipeline: wgpu::RenderPipeline,
+    /// Per-source union pass (MAX), used inside one stencil source.
+    mask_union_pipeline: wgpu::RenderPipeline,
+    /// Scratch target for one stencil source's union before it is intersected.
+    mask_scratch: Option<MaskTarget>,
+    /// Fullscreen pipeline that multiplies the scratch coverage into a group.
+    mask_intersect_pipeline: wgpu::RenderPipeline,
+    /// Bind group exposing the scratch coverage as a texture.
+    mask_scratch_bind_group: wgpu::BindGroup,
+    mask_scratch_layout: wgpu::BindGroupLayout,
+    mask_scratch_sampler: wgpu::Sampler,
     sampler: wgpu::Sampler,
     _white_mask_texture: wgpu::Texture,
     white_mask: wgpu::TextureView,
@@ -253,6 +263,72 @@ impl GpuRenderer {
             )
         });
         let mask_pipeline = create_mask_pipeline(&device, &pipeline_layout, &shader);
+        let mask_union_pipeline = create_mask_union_pipeline(&device, &pipeline_layout, &shader);
+        let mask_scratch_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("yu-emote mask scratch sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let mask_scratch_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("yu-emote mask scratch layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        // A 1x1 placeholder keeps the bind group valid before the first frame
+        // allocates the real scratch target.
+        let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("yu-emote mask scratch placeholder"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let placeholder_view =
+            placeholder.create_view(&wgpu::TextureViewDescriptor::default());
+        let mask_scratch_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yu-emote mask scratch bind"),
+            layout: &mask_scratch_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&mask_scratch_sampler),
+                },
+            ],
+        });
+        let mask_intersect_pipeline =
+            create_mask_intersect_pipeline(&device, &mask_scratch_layout);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("yu-emote sampler"),
@@ -299,6 +375,12 @@ impl GpuRenderer {
             texture_layout,
             pipelines,
             mask_pipeline,
+            mask_union_pipeline,
+            mask_scratch: None,
+            mask_intersect_pipeline,
+            mask_scratch_bind_group,
+            mask_scratch_layout,
+            mask_scratch_sampler,
             sampler,
             _white_mask_texture: white_mask_texture,
             white_mask,
@@ -472,12 +554,15 @@ impl GpuRenderer {
             .map(|(slot, group)| (*group, slot))
             .collect();
 
-        let mut mask_draws: Vec<(usize, Range<u32>, wgpu::BindGroup)> = Vec::new();
+        // (slot, source_ordinal, range, bind) — the ordinal keeps one stencil
+        // source's triangles together so they union with MAX before sources
+        // intersect.
+        let mut mask_draws: Vec<(usize, usize, Range<u32>, wgpu::BindGroup)> = Vec::new();
         for (slot, &group) in group_ids.iter().enumerate() {
             let Some(owner) = plan.mask_groups.get(group) else {
                 continue;
             };
-            for &source in &owner.sources {
+            for (ordinal, &source) in owner.sources.iter().enumerate() {
                 let Some(range) = range_by_item.get(&source).copied() else {
                     continue;
                 };
@@ -491,7 +576,7 @@ impl GpuRenderer {
                 let Some(bind) = self.bind_group(resource, &white, 0) else {
                     continue;
                 };
-                mask_draws.push((slot, range.start..range.start + range.count, bind));
+                mask_draws.push((slot, ordinal, range.start..range.start + range.count, bind));
             }
         }
 
@@ -530,7 +615,7 @@ impl GpuRenderer {
         stats.draw_calls = (color_draws.len() + mask_draws.len()) as u64;
         stats.mask_passes = mask_draws
             .iter()
-            .map(|(slot, _, _)| *slot)
+            .map(|(slot, ordinal, _, _)| (*slot, *ordinal))
             .collect::<std::collections::BTreeSet<_>>()
             .len() as u64;
 
@@ -541,38 +626,119 @@ impl GpuRenderer {
             });
 
         if !self.masks.is_empty() {
-            for (slot, target) in self.masks.iter().enumerate() {
-                let draws: Vec<&(usize, Range<u32>, wgpu::BindGroup)> = mask_draws
-                    .iter()
-                    .filter(|(draw_slot, _, _)| *draw_slot == slot)
-                    .collect();
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("yu-emote mask pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &target.view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                pass.set_pipeline(&self.mask_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                if let Some(vertex_buffer) = &self.vertex_buffer {
-                    pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                }
-                if let Some(index_buffer) = &self.index_buffer {
-                    pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                }
-                for (_, range, bind) in draws {
-                    pass.set_bind_group(1, bind, &[]);
-                    pass.draw_indexed(range.clone(), 0, 0..1);
+            self.ensure_mask_scratch(width, height);
+            if let Some(scratch) = self.mask_scratch.as_ref() {
+                for (slot, target) in self.masks.iter().enumerate() {
+                    // Official stencil semantics (`emotedriver.dll` 0x10057d80
+                    // and the state block at 0x10057fa9): every source
+                    // increments a stencil counter across its own triangles, and
+                    // the consumer draws where `STENCILFUNC=EQUAL ref` with
+                    // ref = source count. That is "union inside one source,
+                    // intersection across sources".
+                    //
+                    // Implemented as: each source unions with MAX into a scratch
+                    // target, then multiplies into the group target. Keeping the
+                    // operations in separate passes matters — a single pass with
+                    // product blending would also multiply the triangles *of the
+                    // same source* together.
+                    let draws: Vec<&(usize, usize, Range<u32>, wgpu::BindGroup)> = mask_draws
+                        .iter()
+                        .filter(|(draw_slot, _, _, _)| *draw_slot == slot)
+                        .collect();
+                    let mut ordinals: Vec<usize> = draws.iter().map(|d| d.1).collect();
+                    ordinals.sort_unstable();
+                    ordinals.dedup();
+
+                    // Start the group target at the multiplicative identity.
+                    {
+                        let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("yu-emote mask reset"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &target.view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                                        r: 1.0,
+                                        g: 1.0,
+                                        b: 1.0,
+                                        a: 1.0,
+                                    }),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                    }
+
+                    for ordinal in ordinals {
+                        // Union this source's triangles into the scratch target.
+                        {
+                            let mut pass =
+                                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("yu-emote mask source union"),
+                                    color_attachments: &[Some(
+                                        wgpu::RenderPassColorAttachment {
+                                            view: &scratch.view,
+                                            depth_slice: None,
+                                            resolve_target: None,
+                                            ops: wgpu::Operations {
+                                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                                    r: 0.0,
+                                                    g: 0.0,
+                                                    b: 0.0,
+                                                    a: 1.0,
+                                                }),
+                                                store: wgpu::StoreOp::Store,
+                                            },
+                                        },
+                                    )],
+                                    depth_stencil_attachment: None,
+                                    timestamp_writes: None,
+                                    occlusion_query_set: None,
+                                    multiview_mask: None,
+                                });
+                            pass.set_pipeline(&self.mask_union_pipeline);
+                            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                            if let Some(vertex_buffer) = &self.vertex_buffer {
+                                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                            }
+                            if let Some(index_buffer) = &self.index_buffer {
+                                pass.set_index_buffer(
+                                    index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                            }
+                            for draw in draws.iter().filter(|d| d.1 == ordinal) {
+                                pass.set_bind_group(1, &draw.3, &[]);
+                                pass.draw_indexed(draw.2.clone(), 0, 0..1);
+                            }
+                        }
+                        // Intersect the source coverage into the group target with
+                        // `dst *= src`.
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("yu-emote mask intersect"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &target.view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_pipeline(&self.mask_intersect_pipeline);
+                        pass.set_bind_group(0, &self.mask_scratch_bind_group, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
                 }
             }
         }
@@ -802,6 +968,53 @@ impl GpuRenderer {
         }
     }
 
+    /// Allocate (or resize) the scratch target that holds one stencil source's
+    /// unioned coverage before it is intersected into a group.
+    fn ensure_mask_scratch(&mut self, width: u32, height: u32) {
+        let needs = match self.mask_scratch.as_ref() {
+            Some(scratch) => scratch.width != width || scratch.height != height,
+            None => true,
+        };
+        if !needs {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("yu-emote mask scratch"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: TARGET_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.mask_scratch_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("yu-emote mask scratch bind"),
+            layout: &self.mask_scratch_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.mask_scratch_sampler),
+                },
+            ],
+        });
+        self.mask_scratch = Some(MaskTarget {
+            width,
+            height,
+            view,
+        });
+    }
+
     fn ensure_buffers(&mut self, vertices: &[GpuVertex], indices: &[u32]) {
         let vertex_bytes = std::mem::size_of_val(vertices) as u64;
         if self.vertex_buffer.is_none() || self.vertex_capacity < vertex_bytes {
@@ -886,10 +1099,11 @@ fn build_scene(plan: &RenderPlan, textures: &BTreeMap<u32, TextureEntry>) -> Sce
 }
 
 fn color_item(item: &DrawItem) -> bool {
-    !matches!(
-        item.pass,
-        crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
-    )
+    item.paints_color
+        && !matches!(
+            item.pass,
+            crate::EmoteDrawPass::MaskGeneration | crate::EmoteDrawPass::StencilCompositeMask
+        )
 }
 
 fn native_blend_state(mode: u32) -> wgpu::BlendState {
@@ -1020,15 +1234,70 @@ fn create_color_pipeline(
     })
 }
 
+/// Union pass: `max(dst, src)`, used to accumulate the triangles of ONE stencil
+/// source. Sources are then intersected (see [`create_mask_pipeline`]).
+fn create_mask_union_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+) -> wgpu::RenderPipeline {
+    let union = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Max,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("yu-emote mask union pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(vertex_layout())],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_mask"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: union,
+                    alpha: union,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 fn create_mask_pipeline(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
     shader: &wgpu::ShaderModule,
 ) -> wgpu::RenderPipeline {
-    let max = wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::One,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Max,
+    // Official stencil semantics (see the render-state block at
+    // `emotedriver.dll` 0x10057fa9..0x1005825b): every source increments a
+    // stencil counter and the consumer tests `EQUAL ref` with ref = source
+    // count. Multiple sources therefore intersect. dst *= src accumulates that
+    // AND-like product; the old MAX blend produced a union instead.
+    let intersect = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Dst,
+        dst_factor: wgpu::BlendFactor::Zero,
+        operation: wgpu::BlendOperation::Add,
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("yu-emote mask pipeline"),
@@ -1057,8 +1326,96 @@ fn create_mask_pipeline(
             targets: &[Some(wgpu::ColorTargetState {
                 format: TARGET_FORMAT,
                 blend: Some(wgpu::BlendState {
-                    color: max,
-                    alpha: max,
+                    color: intersect,
+                    alpha: intersect,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// Shader that multiplies a scratch coverage texture into the current target.
+const MASK_INTERSECT_WGSL: &str = r#"
+@group(0) @binding(0) var scratch_tex: texture_2d<f32>;
+@group(0) @binding(1) var scratch_sampler: sampler;
+
+struct VsOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VsOut {
+    var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(3.0, 1.0),
+    );
+    let p = positions[index];
+    var out: VsOut;
+    out.position = vec4<f32>(p, 0.0, 1.0);
+    out.uv = vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5);
+    return out;
+}
+
+@fragment
+fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
+    let coverage = textureSample(scratch_tex, scratch_sampler, input.uv).r;
+    return vec4<f32>(coverage, 0.0, 0.0, 1.0);
+}
+"#;
+
+/// `dst *= src` pipeline: intersects one source's coverage into a group target.
+fn create_mask_intersect_pipeline(
+    device: &wgpu::Device,
+    scratch_layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("yu-emote mask intersect shader"),
+        source: wgpu::ShaderSource::Wgsl(MASK_INTERSECT_WGSL.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("yu-emote mask intersect layout"),
+        bind_group_layouts: &[Some(scratch_layout)],
+        immediate_size: 0,
+    });
+    let intersect = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Dst,
+        dst_factor: wgpu::BlendFactor::Zero,
+        operation: wgpu::BlendOperation::Add,
+    };
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("yu-emote mask intersect pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            unclipped_depth: false,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: TARGET_FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: intersect,
+                    alpha: intersect,
                 }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
