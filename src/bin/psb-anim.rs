@@ -26,13 +26,22 @@ use serde_json::json;
 use yu_emote::{EMOTE_TICKS_PER_SECOND, Emote, TimelinePlayMode, soft};
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
-    }
+    // PSB v4 models recurse deep enough to overflow the default Windows
+    // main-thread stack; run the demo on a worker with the same 64 MiB budget
+    // the kernel host uses.
+    std::thread::Builder::new()
+        .name("psb-demo".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| match run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        })
+        .expect("spawn psb-demo thread")
+        .join()
+        .unwrap_or(ExitCode::FAILURE)
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {

@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
+winit = "0.30"
 eluna = { package = "eluna_rs", path = "vendor/eluna" }
 png = "0.17"
 pollster = "0.4"
@@ -58,3 +59,7 @@ path = "src/bin/psb-gpu.rs"
 
 [profile.release]
 lto = "thin"
+
+[[bin]]
+name = "psb-window"
+path = "src/bin/psb-window.rs"
